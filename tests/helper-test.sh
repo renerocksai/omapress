@@ -105,6 +105,44 @@ mkfifo "$work/pipe.xml"
 out=$("$helper" fetch --url "https://pipe.example.org/rss.xml" --source "$work/pipe.xml" 2>/dev/null || true)
 [[ $(field 'd["message"]' <<<"$out") == "Feed URL refused: source is not a regular file" ]] || fail "fifo source: $(field 'd["message"]' <<<"$out")"
 
+# ---- Filesystem boundary.
+
+# A symlink planted where the state file lives is neither followed nor
+# written through: the read yields empty state, the write replaces the link.
+victim="$work/victim"; echo '{"secret":1}' > "$victim"
+rm -f "$OMAPRESS_STATE_DIR/state.json"; ln -s "$victim" "$OMAPRESS_STATE_DIR/state.json"
+out=$(src "$fixture")
+[[ $(cat "$victim") == '{"secret":1}' ]] || fail "write followed a planted symlink"
+[[ -f "$OMAPRESS_STATE_DIR/state.json" && ! -L "$OMAPRESS_STATE_DIR/state.json" ]] || fail "symlink was not replaced by a regular file"
+[[ $(field 'd["newIds"]' <<<"$out") == "[]" ]] || fail "planted symlink should read as a first run without announcing"
+
+# A hardlinked cache entry is refused.
+ln "$OMAPRESS_CACHE_DIR/feed.json" "$work/hardlink"
+out=$("$helper" fetch --offline --url "$url" 2>/dev/null || true)
+[[ $(field 'd["state"]' <<<"$out") == error ]] || fail "hardlinked cache was trusted"
+rm "$work/hardlink"
+out=$("$helper" fetch --offline --url "$url")
+[[ $(field 'd["state"]' <<<"$out") == ready ]] || fail "cache unusable after removing hardlink"
+
+# Files land 0600, the directory 0700, and no temp files linger.
+[[ $(stat -c %a "$OMAPRESS_CACHE_DIR/feed.json") == 600 ]] || fail "cache file mode"
+[[ $(stat -c %a "$OMAPRESS_STATE_DIR") == 700 ]] || fail "state dir mode"
+chmod 755 "$OMAPRESS_STATE_DIR"; src "$fixture" >/dev/null
+[[ $(stat -c %a "$OMAPRESS_STATE_DIR") == 700 ]] || fail "loose dir mode not tightened"
+[[ -z $(ls -A "$OMAPRESS_STATE_DIR" | grep -v '^state.json$') ]] || fail "leftovers in state dir: $(ls -A "$OMAPRESS_STATE_DIR")"
+touch "$OMAPRESS_STATE_DIR/.state.json.deadbeef.tmp"; src "$fixture" >/dev/null
+[[ ! -e "$OMAPRESS_STATE_DIR/.state.json.deadbeef.tmp" ]] || fail "stale temp file not swept"
+
+# A state directory that is itself a symlink is refused, as JSON, exit 1.
+mkdir "$work/elsewhere"; ln -s "$work/elsewhere" "$work/linkdir"
+if out=$(OMAPRESS_STATE_DIR="$work/linkdir" "$helper" fetch --offline --url "$url" 2>/dev/null); then fail "symlinked state dir accepted"; fi
+[[ $(field 'd["message"]' <<<"$out") == *"is a symlink"* ]] || fail "symlinked dir message: $(field 'd["message"]' <<<"$out")"
+
+# A state file that is a FIFO does not block the run.
+rm "$OMAPRESS_STATE_DIR/state.json"; mkfifo "$OMAPRESS_STATE_DIR/state.json"
+out=$(timeout 10 "$helper" fetch --offline --url "$url") || fail "fifo state blocked or failed"
+[[ -f "$OMAPRESS_STATE_DIR/state.json" ]] || fail "fifo not replaced"
+
 # Atom feeds parse too.
 out=$("$helper" fetch --url "https://atom.example.org/feed.atom" --source "$here/fixtures/feed.atom")
 [[ $(field 'd["feed"]["title"]' <<<"$out") == "Atom Example" ]] || fail "atom title"

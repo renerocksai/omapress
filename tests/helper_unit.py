@@ -250,6 +250,7 @@ class Caps(unittest.TestCase):
         import json, tempfile
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["OMAPRESS_STATE_DIR"] = tmp
+            om._STORES.clear()
             try:
                 with open(os.path.join(tmp, "state.json"), "w") as handle:
                     json.dump({"read": ["r%d" % i for i in range(5000)] + [5, "bad id", ""], "known": "nope"}, handle)
@@ -261,6 +262,7 @@ class Caps(unittest.TestCase):
                 self.assertEqual(om.load_state()["read"], [])
             finally:
                 del os.environ["OMAPRESS_STATE_DIR"]
+                om._STORES.clear()
 
 
 if __name__ == "__main__":

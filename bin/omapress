@@ -21,7 +21,10 @@ in bounded chunks under a byte cap. Every run has one absolute deadline
 State lives in $XDG_STATE_HOME/omapress (read/known post ids); the last good
 feed is cached in $XDG_CACHE_HOME/omapress so the panel has something to show
 while offline. Both can be redirected with OMAPRESS_STATE_DIR and
-OMAPRESS_CACHE_DIR, which the tests use.
+OMAPRESS_CACHE_DIR, which the tests use. Each directory is claimed by a held
+descriptor, must be ours and 0700, and is read and written only relative to
+that descriptor: no symlink is followed, files must be regular and singly
+linked, and writes are exclusive temp files renamed into place.
 """
 
 import argparse
@@ -31,7 +34,9 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
+import stat
 import socket
 import sys
 import time
@@ -291,32 +296,119 @@ def cache_dir():
     return os.environ.get("OMAPRESS_CACHE_DIR") or os.path.join(_xdg("XDG_CACHE_HOME", ".cache"), "omapress")
 
 
-def state_path():
-    return os.path.join(state_dir(), "state.json")
+class StateError(Exception):
+    """The private directory cannot be used safely."""
 
 
-def cache_path():
-    return os.path.join(cache_dir(), "feed.json")
+class PrivateDir:
+    """A directory we own, held open by descriptor so every read and write is
+    relative to the directory we checked rather than to a path that could be
+    re-pointed underneath us.
+
+    Reads accept only an owned, regular, singly-linked file under a byte cap,
+    opened without following symlinks. Writes go to a random-named O_EXCL 0600
+    temp file, fsync, then rename over the entry, which replaces a planted
+    symlink rather than following it.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as error:
+            # O_DIRECTORY|O_NOFOLLOW on a symlink reports ENOTDIR on Linux.
+            if error.errno in (errno.ELOOP, errno.ENOTDIR) and os.path.islink(path):
+                raise StateError("%s is a symlink" % path)
+            raise StateError("%s: %s" % (path, error.strerror))
+        info = os.fstat(self.fd)
+        if info.st_uid != os.getuid():
+            os.close(self.fd)
+            raise StateError("%s is not owned by this user" % path)
+        if info.st_mode & 0o077:
+            os.fchmod(self.fd, 0o700)
+
+    def read(self, name, limit):
+        """The file's bytes, or None when it is absent or not ours to trust."""
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=self.fd)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENXIO):
+                return None
+            raise
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_size > limit:
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                return read_bounded(handle, limit)
+        except BodyTooLarge:
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def write(self, name, data):
+        tmp = ".%s.%s.tmp" % (name, secrets.token_hex(8))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.fd)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.fsync(self.fd)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+
+    def sweep(self):
+        """Drop temp files an interrupted earlier run may have left behind."""
+        try:
+            names = os.listdir(self.fd)
+        except OSError:
+            return
+        for name in names[:1000]:
+            if name.startswith(".") and name.endswith(".tmp"):
+                try:
+                    os.unlink(name, dir_fd=self.fd)
+                except OSError:
+                    pass
 
 
-def read_json(path, fallback, limit):
-    """A dict from a JSON file no larger than `limit` bytes, else fallback."""
-    try:
-        with open(path, "rb") as handle:
-            raw = read_bounded(handle, limit)
-        data = json.loads(raw.decode("utf-8"))
-        return data if isinstance(data, dict) else fallback
-    except (OSError, ValueError, BodyTooLarge, UnicodeDecodeError):
+_STORES = {}
+
+
+def store(kind):
+    if kind not in _STORES:
+        _STORES[kind] = PrivateDir(state_dir() if kind == "state" else cache_dir())
+        _STORES[kind].sweep()
+    return _STORES[kind]
+
+
+def read_json(kind, name, fallback, limit):
+    """A dict from a JSON file in the private store, else fallback."""
+    raw = store(kind).read(name, limit)
+    if raw is None:
         return fallback
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return fallback
+    return data if isinstance(data, dict) else fallback
 
 
-def write_json(path, data):
-    directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
-    os.replace(tmp, path)
+def write_json(kind, name, data):
+    store(kind).write(name, json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 # --------------------------------------------------------------- html → text
@@ -739,7 +831,7 @@ def _id_list(value, limit):
 
 
 def load_state():
-    state = read_json(state_path(), {}, MAX_STATE_BYTES)
+    state = read_json("state", "state.json", {}, MAX_STATE_BYTES)
     return {
         "schemaVersion": SCHEMA_VERSION,
         "read": _id_list(state.get("read"), MAX_STATE_IDS),
@@ -758,7 +850,7 @@ def save_state(state, item_ids):
         tail = [value for value in values if value not in keep]
         return (kept + tail[-(MAX_STATE_IDS - len(kept)):])[:MAX_STATE_IDS] if len(kept) < MAX_STATE_IDS else kept[:MAX_STATE_IDS]
 
-    write_json(state_path(), {
+    write_json("state", "state.json", {
         "schemaVersion": SCHEMA_VERSION,
         "read": prune(state["read"]),
         "known": prune(state["known"]),
@@ -861,7 +953,7 @@ def coerce_cache(value):
 
 
 def load_cache():
-    return coerce_cache(read_json(cache_path(), {}, MAX_CACHE_BYTES))
+    return coerce_cache(read_json("cache", "feed.json", {}, MAX_CACHE_BYTES))
 
 
 def emit(payload):
@@ -951,12 +1043,12 @@ def cmd_fetch(args):
                     "feed": feed,
                     "items": items,
                 }
-                write_json(cache_path(), cache)
+                write_json("cache", "feed.json", cache)
                 cache_matches = True
                 source = "network"
             elif status == 304 and cache_matches:
                 cache["fetchedTs"] = now
-                write_json(cache_path(), cache)
+                write_json("cache", "feed.json", cache)
                 source = "network"
             else:
                 message = "Feed said not-modified but nothing is cached"
@@ -1101,6 +1193,9 @@ def main(argv):
     signal.alarm(int(budget) + 5)
     try:
         return args.func(args)
+    except StateError as error:
+        emit(error_payload("Cannot use the plugin's state directory: %s" % error, getattr(args, "url", ""), int(time.time())))
+        return 1
     except Timeout:
         emit(error_payload("Feed fetch ran out of time", getattr(args, "url", ""), int(time.time())))
         return 1
