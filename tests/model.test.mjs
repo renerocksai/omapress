@@ -78,6 +78,47 @@ test("notifyText is single-line, clipped, and control-free", () => {
   assert.equal(Model.notifyText(null), "")
 })
 
+test("safeUrl enforces the link policy at the consumer", () => {
+  assert.equal(Model.safeLink("https://omarchy.org/news/x"), "https://omarchy.org/news/x")
+  assert.equal(Model.safeLink("http://omarchy.org/news/x"), "http://omarchy.org/news/x")
+  assert.equal(Model.safeLink("HTTPS://Omarchy.org/X"), "HTTPS://Omarchy.org/X")
+  const bad = [
+    "javascript:alert(1)", "file:///etc/passwd", "ftp://a.example/", "mailto:a@b.example",
+    "https://user:pw@omarchy.org/", "https://real.example@evil.example/", "https://omarchy.org:8443/",
+    "https://omarchy.org:443/", "https://localhost/", "https://foo.localhost/", "https://printer.local/",
+    "https://box.lan/", "https://svc.internal/", "https://127.0.0.1/", "https://[::1]/", "https://2130706433/",
+    "https://0x7f000001/", "https://omarchy.org/a b", "https://omarchy.org/a\tb", "https://omarchy.org/\x00",
+    "https://single/", "https:///path", "", null, 42, "https://omarchy.org/" + "x".repeat(3000), "//omarchy.org/x",
+    "https:omarchy.org"
+  ]
+  for (const url of bad) assert.equal(Model.safeLink(url), "", String(url))
+})
+
+test("safeFeedUrl is https only", () => {
+  assert.equal(Model.safeFeedUrl(" https://omarchy.org/news/rss.xml "), "https://omarchy.org/news/rss.xml")
+  assert.equal(Model.safeFeedUrl("http://omarchy.org/news/rss.xml"), "")
+  assert.equal(Model.safeFeedUrl("file:///home/me/feed.xml"), "")
+  assert.equal(Model.safeFeedUrl("https://localhost/rss.xml"), "")
+})
+
+test("safeColor accepts only theme, hex, or a plain name", () => {
+  assert.equal(Model.safeColor("#e5484d"), "#e5484d")
+  assert.equal(Model.safeColor("#ABC"), "#abc")
+  assert.equal(Model.safeColor("#e5484d80"), "#e5484d80")
+  assert.equal(Model.safeColor("tomato"), "tomato")
+  assert.equal(Model.safeColor("theme"), "theme")
+  assert.equal(Model.safeColor(""), "theme")
+  assert.equal(Model.safeColor("url(evil)"), "theme")
+  assert.equal(Model.safeColor("#ggg"), "theme")
+  assert.equal(Model.safeColor(42), "theme")
+})
+
+test("coerceItem drops links that fail the policy", () => {
+  const item = Model.coerceItem({ id: "x", link: "javascript:1", links: [{ href: "https://u@a.example/" }, { href: "https://ok.example/" }] })
+  assert.equal(item.link, "")
+  assert.deepEqual(item.links.map(l => l.href), ["https://ok.example/"])
+})
+
 test("dateLabel uses day words near today and drops the year otherwise", () => {
   assert.equal(Model.dateLabel(ts(2026, 9, 3), NOW), "Today")
   assert.equal(Model.dateLabel(ts(2026, 9, 2), NOW), "Yesterday")

@@ -201,6 +201,16 @@ def check_url(url, allow_http=False, resolve=True):
     return value
 
 
+def safe_link(url):
+    """A link the panel may show and open: http or https under the same
+    host rules as the feed, minus the DNS check, which would cost one
+    resolution per link at parse time. Anything else becomes ""."""
+    try:
+        return check_url(url, allow_http=True, resolve=False)
+    except UrlError:
+        return ""
+
+
 def _looks_like_ip(host):
     try:
         ipaddress.ip_address(host)
@@ -545,9 +555,10 @@ class BlockParser(HTMLParser):
             href = self._link_href
             self._link_text = None
             self._link_href = ""
-            if len(self.links) >= MAX_LINKS_PER_ITEM or len(href) > MAX_ID_CHARS:
+            if len(self.links) >= MAX_LINKS_PER_ITEM:
                 return
-            if href and href.startswith(("http://", "https://")):
+            href = safe_link(href)
+            if href:
                 key = href.rstrip("/")
                 if key not in self._seen_links:
                     self._seen_links.add(key)
@@ -631,13 +642,10 @@ def _build_item(item_id, title, link, author, published_ts, summary_html, body_h
         return None
     blocks, links = html_to_blocks(body_html or summary_html)
     summary = summarize(html_to_text(summary_html) or (blocks[0]["text"] if blocks else ""))
-    link = str(link or "").strip()
-    if len(link) > MAX_ID_CHARS:
-        link = ""
     return {
         "id": item_id,
         "title": clean_text(title, MAX_TITLE_CHARS) or "Untitled",
-        "link": link,
+        "link": safe_link(str(link or "").strip()),
         "author": clean_text(author, MAX_AUTHOR_CHARS),
         "publishedTs": max(0, min(4102444800, int(published_ts or 0))),
         "summary": clean_text(summary, MAX_SUMMARY_CHARS),
@@ -647,10 +655,9 @@ def _build_item(item_id, title, link, author, published_ts, summary_html, body_h
 
 
 def _feed_info(title, link, description):
-    link = str(link or "").strip()
     return {
         "title": clean_text(title, MAX_FEED_TITLE_CHARS),
-        "link": link if len(link) <= MAX_ID_CHARS else "",
+        "link": safe_link(str(link or "").strip()),
         "description": clean_text(description, MAX_FEED_DESC_CHARS),
     }
 
@@ -876,8 +883,8 @@ def coerce_block(value):
 def coerce_link(value):
     if not isinstance(value, dict) or not isinstance(value.get("href"), str):
         return None
-    href = value["href"].strip()
-    if not href or len(href) > MAX_ID_CHARS:
+    href = safe_link(value["href"].strip())
+    if not href:
         return None
     return {"text": clean_text(value.get("text"), MAX_LINK_TEXT_CHARS) or href, "href": href}
 
@@ -904,7 +911,7 @@ def coerce_item(value):
         body += len(coerced["text"])
         blocks.append(coerced)
     links = [link for link in (coerce_link(entry) for entry in (value.get("links") if isinstance(value.get("links"), list) else [])[:MAX_LINKS_PER_ITEM]) if link]
-    link = value.get("link") if isinstance(value.get("link"), str) else ""
+    link = safe_link(value.get("link").strip()) if isinstance(value.get("link"), str) else ""
     try:
         published = int(value.get("publishedTs") or 0)
     except (TypeError, ValueError):
@@ -912,7 +919,7 @@ def coerce_item(value):
     return {
         "id": item_id,
         "title": clean_text(value.get("title"), MAX_TITLE_CHARS) or "Untitled",
-        "link": link.strip() if len(link) <= MAX_ID_CHARS else "",
+        "link": link,
         "author": clean_text(value.get("author"), MAX_AUTHOR_CHARS),
         "publishedTs": max(0, min(4102444800, published)),
         "summary": clean_text(value.get("summary"), MAX_SUMMARY_CHARS),

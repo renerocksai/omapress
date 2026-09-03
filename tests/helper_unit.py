@@ -92,6 +92,33 @@ class UrlPolicy(unittest.TestCase):
         self.assertTrue(om._is_public_address("2606:2800:220:1:248:1893:25c8:1946"))
 
 
+class LinkPolicy(unittest.TestCase):
+    def test_safe_link(self):
+        self.assertEqual(om.safe_link("https://omarchy.org/x"), "https://omarchy.org/x")
+        self.assertEqual(om.safe_link("http://omarchy.org/x"), "http://omarchy.org/x")
+        for bad in ("javascript:alert(1)", "file:///etc/passwd", "ftp://a.example/", "https://u:p@a.example/",
+                    "https://localhost/", "https://127.0.0.1/", "https://a.example:8080/", "https://a.example/ x",
+                    "mailto:x@y.example", "https://box.lan/", "", None, "https://a.example/" + "x" * 3000):
+            self.assertEqual(om.safe_link(bad), "", bad)
+
+    def test_links_filtered_at_parse_and_cache(self):
+        body = ('<a href="javascript:alert(1)">js</a><a href="https://u:p@evil.example/">cred</a>'
+                '<a href="https://127.0.0.1/">ip</a><a href="http://ok.example/p">ok</a><a href="https://also.example/">also</a>')
+        rss = ('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>T</title>'
+               '<link>javascript:1</link><item><title>t</title><guid>g</guid><link>https://u@x.example/</link>'
+               '<content:encoded><![CDATA[%s]]></content:encoded></item></channel></rss>' % body).encode()
+        feed, items = om.parse_feed(rss)
+        self.assertEqual(feed["link"], "")
+        self.assertEqual(items[0]["link"], "")
+        self.assertEqual([l["href"] for l in items[0]["links"]], ["http://ok.example/p", "https://also.example/"])
+        cache = om.coerce_cache({"items": [{"id": "g", "link": "https://localhost/x",
+                                            "links": [{"href": "file:///etc/passwd"}, {"href": "https://ok.example/"}]}],
+                                 "feed": {"link": "https://[::1]/"}})
+        self.assertEqual(cache["items"][0]["link"], "")
+        self.assertEqual([l["href"] for l in cache["items"][0]["links"]], ["https://ok.example/"])
+        self.assertEqual(cache["feed"]["link"], "")
+
+
 class Redirects(unittest.TestCase):
     def make(self, url):
         import urllib.request

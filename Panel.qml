@@ -36,8 +36,8 @@ Panel {
   readonly property bool hasNews: news.unread > 0
   // "theme" follows the bar's active color; anything else is a CSS color.
   readonly property color unreadColor: {
-    var value = String(news.setting("unreadColor", "#e5484d")).trim()
-    if (value === "" || value.toLowerCase() === "theme") return urgent
+    var value = Model.safeColor(String(news.setting("unreadColor", "#e5484d")))
+    if (value === "theme") return urgent
     var parsed = Qt.color(value)
     return parsed.valid === false ? urgent : parsed
   }

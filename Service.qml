@@ -23,14 +23,19 @@ Item {
   property bool everLoaded: false
   property string actionStatus: ""
 
-  readonly property string feedUrl: String(setting("feedUrl", "https://omarchy.org/news/rss.xml")).trim() || "https://omarchy.org/news/rss.xml"
+  // The configured feed URL after policy; "" means the setting is unusable
+  // and no fetch runs. An empty setting means the default feed.
+  readonly property string feedUrl: {
+    var configured = String(setting("feedUrl", "")).trim()
+    return Model.safeFeedUrl(configured === "" ? "https://omarchy.org/news/rss.xml" : configured)
+  }
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 1800, 300, 86400)
   readonly property int maxItems: intSetting("maxItems", 30, 5, Model.MAX_ITEMS)
   readonly property bool notifyNewPosts: boolSetting("notifyNewPosts", true)
   readonly property bool busy: fetchProcess.running || markProcess.running
   readonly property string feedTitle: String(feed && feed.title ? feed.title : "") || "Omarchy News"
   readonly property int maxPayloadChars: Model.MAX_PAYLOAD_CHARS
-  readonly property string feedLink: String(feed && feed.link ? feed.link : "") || "https://omarchy.org/news"
+  readonly property string feedLink: Model.safeLink(feed && feed.link ? feed.link : "") || "https://omarchy.org/news"
 
   // Resolve the helper next to this file so a clone runs its own copy.
   readonly property string helperPath: String(Qt.resolvedUrl("bin/omapress")).replace(/^file:\/\//, "")
@@ -59,6 +64,11 @@ Item {
 
   function refresh() {
     if (fetchProcess.running) return
+    if (feedUrl === "") {
+      state = "error"
+      message = "Feed URL must be https and name a public host"
+      return
+    }
     refreshing = true
     fetchProcess.command = ["python3", helperPath, "fetch", "--url", feedUrl, "--max", String(maxItems)]
     fetchProcess.running = true
@@ -136,9 +146,12 @@ Item {
     markProcess.running = true
   }
 
+  // The one path to the browser. Re-checked here even though the helper
+  // filtered the link already: this is the consumer, and the cache between
+  // the two is a file.
   function openUrl(url) {
-    var target = String(url || "").trim()
-    if (!/^https?:\/\//.test(target)) return
+    var target = Model.safeLink(String(url || "").trim())
+    if (target === "") return
     Qt.openUrlExternally(target)
   }
 
@@ -188,7 +201,8 @@ Item {
       var pick = picks[j]
       var args = ["omarchy-notification-send", "--app-name", "Omapress", "-g", "\uf1ea", "-u", "low",
         Model.notifyText(pick.title, 200) || "New post", Model.notifyText(pick.summary) || Model.notifyText(feedTitle, 120)]
-      if (/^https?:\/\//.test(String(pick.link || ""))) args = args.concat(["--exec", "xdg-open", String(pick.link)])
+      var link = Model.safeLink(String(pick.link || ""))
+      if (link !== "") args = args.concat(["--exec", "xdg-open", link])
       Quickshell.execDetached(args)
     }
   }

@@ -47,9 +47,53 @@ function cleanId(value) {
   return text
 }
 
+// ---- URL policy. The same rules bin/omapress applies, re-checked here at
+// the final consumer: a click, a notification's --exec, the feed URL from
+// shell.json. A URL that fails becomes "" and nothing is opened.
+var HOSTNAME_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/
+var BLOCKED_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa", ".lan"]
+
+function safeUrl(value, allowHttp) {
+  var text = typeof value === "string" ? value : ""
+  if (text === "" || text.length > MAX_ID_CHARS) return ""
+  if (/[\s\x00-\x1f\x7f]/.test(text)) return ""
+  var match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^\/?#]*)([\/?#].*)?$/.exec(text)
+  if (!match) return ""
+  var scheme = match[1].toLowerCase()
+  if (scheme !== "https" && !(allowHttp && scheme === "http")) return ""
+  var authority = match[2]
+  if (authority === "" || authority.indexOf("@") !== -1 || authority.indexOf(":") !== -1 || authority.charAt(0) === "[") return ""
+  var host = authority.toLowerCase().replace(/\.$/, "")
+  if (host === "localhost") return ""
+  for (var i = 0; i < BLOCKED_SUFFIXES.length; i++) {
+    if (host.length > BLOCKED_SUFFIXES[i].length && host.substring(host.length - BLOCKED_SUFFIXES[i].length) === BLOCKED_SUFFIXES[i]) return ""
+  }
+  if (/^[0-9.]+$/.test(host) || /^0x[0-9a-f]+$/.test(host)) return ""
+  if (!HOSTNAME_RE.test(host) || host.indexOf(".") === -1) return ""
+  return text
+}
+
+// A link the panel may show and open: http or https.
+function safeLink(value) {
+  return safeUrl(value, true)
+}
+
+// The feed URL from settings: https only, the same as the helper enforces.
+function safeFeedUrl(value) {
+  return safeUrl(typeof value === "string" ? value.trim() : "", false)
+}
+
+// unreadColor from settings: "theme", a hex color, or a plain color name.
+function safeColor(value) {
+  var text = typeof value === "string" ? value.trim().toLowerCase() : ""
+  if (text === "" || text === "theme") return "theme"
+  if (/^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/.test(text)) return text
+  if (/^[a-z]{1,24}$/.test(text)) return text
+  return "theme"
+}
+
 function cleanUrlish(value) {
-  var text = typeof value === "string" ? value.trim() : ""
-  return text.length > MAX_ID_CHARS ? "" : text
+  return safeLink(typeof value === "string" ? value.trim() : "")
 }
 
 function notifyText(value, limit) {
@@ -273,6 +317,10 @@ if (typeof module !== "undefined") {
     MAX_LINKS_PER_ITEM: MAX_LINKS_PER_ITEM,
     cleanText: cleanText,
     cleanId: cleanId,
+    safeUrl: safeUrl,
+    safeLink: safeLink,
+    safeFeedUrl: safeFeedUrl,
+    safeColor: safeColor,
     notifyText: notifyText,
     coerceItem: coerceItem,
     parsePayload: parsePayload,
