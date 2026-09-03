@@ -4,6 +4,8 @@ Omarchy news in the Omarchy bar. A newspaper icon that turns red when
 [omarchy.org/news](https://omarchy.org/news) has posts you haven't read, and a
 keyboard-driven panel that lets you read them without opening a browser.
 
+<img src="preview.png" alt="The bar icon lit red, and the panel listing the latest Omarchy news posts" width="405">
+
 - **Bar widget**: the icon is colored while there are unread posts, plain when
   you're caught up. Left click opens the panel, right click refreshes, middle
   click marks everything read.
