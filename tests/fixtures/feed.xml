@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Fixture News</title>
+    <link>https://example.org/news</link>
+    <description>Test feed</description>
+<item>
+  <title>Fresh post &amp; friends</title>
+  <link>https://example.org/fresh</link>
+  <guid isPermaLink="true">https://example.org/fresh</guid>
+  <pubDate>Wed, 02 Sep 2026 00:00:00 GMT</pubDate>
+  <dc:creator>DHH</dc:creator>
+  <description><![CDATA[Short <b>summary</b> here.]]></description>
+  <content:encoded><![CDATA[<p>Hello   world, this has <a href="https://example.org/a">a link</a> and <strong>bold</strong> text.</p>
+<h2>Heading</h2>
+<ul><li>first</li><li>second <a href="https://example.org/a/">dup link</a></li></ul>
+<blockquote><p>quoted</p></blockquote>
+<pre><code>x = 1
+y = 2</code></pre>
+<script>alert("no")</script>]]></content:encoded>
+</item>
+<item>
+  <title>Description only</title>
+  <link>https://example.org/desc</link>
+  <guid>https://example.org/desc</guid>
+  <pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate>
+  <description><![CDATA[<p>Only a description, no body.</p>]]></description>
+</item>
+<item>
+  <title>Ancient</title>
+  <link>https://example.org/old</link>
+  <guid>https://example.org/old</guid>
+  <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate>
+  <description>old news</description>
+</item>
+  </channel>
+</rss>

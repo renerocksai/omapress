@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""Helper for the Omapress shell plugin.
+
+Fetches an RSS/Atom feed (the Omarchy news feed by default), converts each
+post into plain-text blocks the panel can render, keeps track of which posts
+have been read, and prints a single JSON document on stdout.
+
+Standard library only; no third-party modules.
+
+    omapress fetch [--url URL] [--max N] [--timeout SEC] [--offline]
+    omapress mark-read ID...
+    omapress mark-unread ID...
+    omapress mark-all-read
+
+State lives in $XDG_STATE_HOME/omapress (read/known post ids); the last good
+feed is cached in $XDG_CACHE_HOME/omapress so the panel has something to show
+while offline. Both can be redirected with OMAPRESS_STATE_DIR and
+OMAPRESS_CACHE_DIR, which the tests use.
+"""
+
+import argparse
+import email.utils
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from html.parser import HTMLParser
+from xml.etree import ElementTree as ET
+
+SCHEMA_VERSION = 1
+DEFAULT_URL = "https://omarchy.org/news/rss.xml"
+DEFAULT_MAX_ITEMS = 30
+DEFAULT_TIMEOUT = 10
+# On the very first run everything older than this is marked read, so a fresh
+# install shows what's new rather than lighting up for the whole archive.
+FIRST_RUN_UNREAD_DAYS = 14
+USER_AGENT = "omapress/0.1 (+https://github.com/renerocksai/omapress)"
+
+NS_CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
+NS_DC = "{http://purl.org/dc/elements/1.1/}"
+NS_ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+# --------------------------------------------------------------------- paths
+
+def _xdg(env, fallback):
+    base = os.environ.get(env)
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), fallback)
+    return base
+
+
+def state_dir():
+    return os.environ.get("OMAPRESS_STATE_DIR") or os.path.join(_xdg("XDG_STATE_HOME", ".local/state"), "omapress")
+
+
+def cache_dir():
+    return os.environ.get("OMAPRESS_CACHE_DIR") or os.path.join(_xdg("XDG_CACHE_HOME", ".cache"), "omapress")
+
+
+def state_path():
+    return os.path.join(state_dir(), "state.json")
+
+
+def cache_path():
+    return os.path.join(cache_dir(), "feed.json")
+
+
+def read_json(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else fallback
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path, data):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------- html → text
+
+class BlockParser(HTMLParser):
+    """Flattens post HTML into a list of {kind, text} blocks plus the links.
+
+    kinds: p, heading, item, quote, code. Inline markup is dropped; block
+    boundaries become separate blocks; <br> becomes a newline inside a block.
+    """
+
+    BLOCK_TAGS = {
+        "p", "div", "section", "article", "header", "footer", "aside", "main",
+        "ul", "ol", "li", "dl", "dt", "dd", "table", "tr", "figure", "figcaption",
+        "blockquote", "pre", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+    }
+    SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "iframe"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks = []
+        self.links = []
+        self._seen_links = set()
+        self._buf = []
+        self._stack = []
+        self._skip = 0
+        self._link_text = None
+        self._link_href = ""
+
+    # ---- helpers
+    def _kind(self):
+        if "pre" in self._stack:
+            return "code"
+        for tag in reversed(self._stack):
+            if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                return "heading"
+            if tag == "li":
+                return "item"
+            if tag == "blockquote":
+                return "quote"
+        return "p"
+
+    def _flush(self):
+        text = "".join(self._buf)
+        self._buf = []
+        kind = self._kind()
+        if kind == "code":
+            text = text.strip("\n")
+            if text.strip() == "":
+                return
+        else:
+            # Collapse whitespace but keep explicit line breaks from <br>.
+            lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in text.split("\n")]
+            text = "\n".join(line for line in lines if line != "")
+            if text == "":
+                return
+        self.blocks.append({"kind": kind, "text": text})
+
+    # ---- parser callbacks
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        if tag in self.BLOCK_TAGS:
+            self._flush()
+            if tag != "hr":
+                self._stack.append(tag)
+            return
+        if tag == "br":
+            self._buf.append("\n")
+            return
+        if tag == "a":
+            href = ""
+            for name, value in attrs:
+                if name == "href" and value:
+                    href = value.strip()
+            self._link_text = []
+            self._link_href = href
+            return
+        if tag == "img":
+            alt = ""
+            for name, value in attrs:
+                if name == "alt" and value:
+                    alt = value.strip()
+            if alt:
+                self._buf.append("[" + alt + "]")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self.BLOCK_TAGS and tag not in ("br", "a", "img"):
+            return
+        if tag == "a":
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS:
+            self._skip = max(0, self._skip - 1)
+            return
+        if self._skip:
+            return
+        if tag in self.BLOCK_TAGS:
+            self._flush()
+            if tag in self._stack:
+                while self._stack:
+                    popped = self._stack.pop()
+                    if popped == tag:
+                        break
+            return
+        if tag == "a":
+            text = "".join(self._link_text or []).strip()
+            href = self._link_href
+            self._link_text = None
+            self._link_href = ""
+            if href and href.startswith(("http://", "https://")):
+                key = href.rstrip("/")
+                if key not in self._seen_links:
+                    self._seen_links.add(key)
+                    self.links.append({"text": re.sub(r"\s+", " ", text) or href, "href": href})
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        self._buf.append(data)
+        if self._link_text is not None:
+            self._link_text.append(data)
+
+    def close(self):
+        super().close()
+        self._flush()
+        self._stack = []
+
+
+def html_to_blocks(markup):
+    parser = BlockParser()
+    try:
+        parser.feed(markup or "")
+        parser.close()
+    except Exception:  # noqa: BLE001 - never let a weird post kill the feed
+        text = re.sub(r"<[^>]+>", " ", markup or "")
+        text = re.sub(r"\s+", " ", text).strip()
+        return ([{"kind": "p", "text": text}] if text else []), []
+    return parser.blocks, parser.links
+
+
+def html_to_text(markup):
+    blocks, _ = html_to_blocks(markup)
+    return " ".join(block["text"].replace("\n", " ") for block in blocks).strip()
+
+
+def summarize(text, limit=220):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > limit * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:") + "…"
+
+
+# ----------------------------------------------------------------- feed parse
+
+def _text(node, *paths):
+    for path in paths:
+        found = node.find(path)
+        if found is not None and found.text:
+            return found.text.strip()
+    return ""
+
+
+def _parse_date(value):
+    value = (value or "").strip()
+    if not value:
+        return 0
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+        if parsed is not None:
+            return int(parsed.timestamp())
+    except (TypeError, ValueError, IndexError):
+        pass
+    # ISO 8601 (Atom). Python's fromisoformat handles the common shapes.
+    try:
+        from datetime import datetime, timezone
+        iso = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(iso)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except ValueError:
+        return 0
+
+
+def _build_item(item_id, title, link, author, published_ts, summary_html, body_html):
+    blocks, links = html_to_blocks(body_html or summary_html)
+    summary = summarize(html_to_text(summary_html) or (blocks[0]["text"] if blocks else ""))
+    return {
+        "id": item_id,
+        "title": re.sub(r"\s+", " ", title or "Untitled").strip(),
+        "link": link,
+        "author": author,
+        "publishedTs": published_ts,
+        "summary": summary,
+        "blocks": blocks,
+        "links": links,
+    }
+
+
+def parse_rss_channel(channel):
+    feed = {
+        "title": _text(channel, "title"),
+        "link": _text(channel, "link"),
+        "description": _text(channel, "description"),
+    }
+    items = []
+    for node in channel.findall("item"):
+        link = _text(node, "link")
+        guid = _text(node, "guid") or link
+        if not guid:
+            continue
+        title = _text(node, "title")
+        author = _text(node, NS_DC + "creator", "author")
+        published = _parse_date(_text(node, "pubDate", NS_DC + "date"))
+        description = _text(node, "description")
+        content = _text(node, NS_CONTENT + "encoded")
+        items.append(_build_item(guid, title, link, author, published, description, content))
+    return feed, items
+
+
+def parse_atom(root):
+    feed = {
+        "title": _text(root, NS_ATOM + "title"),
+        "link": "",
+        "description": _text(root, NS_ATOM + "subtitle"),
+    }
+    for link in root.findall(NS_ATOM + "link"):
+        if link.get("rel", "alternate") == "alternate" and link.get("href"):
+            feed["link"] = link.get("href")
+            break
+    items = []
+    for entry in root.findall(NS_ATOM + "entry"):
+        link = ""
+        for candidate in entry.findall(NS_ATOM + "link"):
+            if candidate.get("rel", "alternate") == "alternate" and candidate.get("href"):
+                link = candidate.get("href")
+                break
+        entry_id = _text(entry, NS_ATOM + "id") or link
+        if not entry_id:
+            continue
+        title = _text(entry, NS_ATOM + "title")
+        author = _text(entry, NS_ATOM + "author/" + NS_ATOM + "name")
+        published = _parse_date(_text(entry, NS_ATOM + "published", NS_ATOM + "updated"))
+        summary = _text(entry, NS_ATOM + "summary")
+        content = _text(entry, NS_ATOM + "content")
+        items.append(_build_item(entry_id, title, link, author, published, summary, content))
+    return feed, items
+
+
+def parse_feed(payload):
+    root = ET.fromstring(payload)
+    if root.tag == NS_ATOM + "feed":
+        return parse_atom(root)
+    channel = root.find("channel")
+    if channel is None:
+        # RSS 1.0 / RDF puts items next to the channel rather than inside it.
+        channel = root
+    return parse_rss_channel(channel)
+
+
+# ---------------------------------------------------------------------- fetch
+
+def fetch_url(url, timeout, etag, last_modified):
+    """Returns (status, body_bytes, headers). status is 200, 304, or raises."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5"}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200, response.read(), dict(response.headers)
+    except urllib.error.HTTPError as error:
+        if error.code == 304:
+            return 304, b"", dict(error.headers or {})
+        raise
+
+
+def describe_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return "Feed returned HTTP %d" % error.code
+    if isinstance(error, urllib.error.URLError):
+        reason = getattr(error, "reason", None)
+        return "Could not reach the feed (%s)" % (reason if reason else "network error")
+    if isinstance(error, ET.ParseError):
+        return "Feed is not valid XML (%s)" % error
+    if isinstance(error, TimeoutError):
+        return "Feed timed out"
+    return str(error) or error.__class__.__name__
+
+
+# ---------------------------------------------------------------------- state
+
+def load_state():
+    state = read_json(state_path(), {})
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "read": list(state.get("read", [])) if isinstance(state.get("read"), list) else [],
+        "known": list(state.get("known", [])) if isinstance(state.get("known"), list) else [],
+        "initialized": bool(state.get("initialized", False)),
+    }
+
+
+def save_state(state, item_ids):
+    # Keep ids that are still in the feed plus a tail of recent history, so a
+    # post that briefly drops out of the feed does not come back as unread.
+    keep = set(item_ids)
+
+    def prune(values):
+        kept = [value for value in values if value in keep]
+        tail = [value for value in values if value not in keep][-500:]
+        return kept + tail
+
+    write_json(state_path(), {
+        "schemaVersion": SCHEMA_VERSION,
+        "read": prune(state["read"]),
+        "known": prune(state["known"]),
+        "initialized": True,
+    })
+
+
+def load_cache():
+    cache = read_json(cache_path(), {})
+    if not isinstance(cache.get("items"), list):
+        return None
+    return cache
+
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.write("\n")
+
+
+def build_payload(state, cache, source, message, new_ids, now):
+    read = set(state["read"])
+    items = []
+    for item in cache.get("items", []):
+        entry = dict(item)
+        entry["read"] = entry["id"] in read
+        items.append(entry)
+    unread = sum(1 for item in items if not item["read"])
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "state": "ready",
+        "message": message,
+        "source": source,
+        "url": cache.get("url", ""),
+        "fetchedTs": int(cache.get("fetchedTs", 0)),
+        "generatedTs": now,
+        "feed": cache.get("feed", {}),
+        "items": items,
+        "unread": unread,
+        "newIds": new_ids,
+    }
+
+
+def error_payload(message, url, now):
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "state": "error",
+        "message": message,
+        "source": "none",
+        "url": url,
+        "fetchedTs": 0,
+        "generatedTs": now,
+        "feed": {},
+        "items": [],
+        "unread": 0,
+        "newIds": [],
+    }
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_fetch(args):
+    now = int(time.time())
+    state = load_state()
+    cache = load_cache()
+    cache_matches = cache is not None and cache.get("url") == args.url
+    message = ""
+    source = "cache"
+
+    if not args.offline:
+        etag = cache.get("etag", "") if cache_matches else ""
+        last_modified = cache.get("lastModified", "") if cache_matches else ""
+        try:
+            status, body, headers = fetch_url(args.url, args.timeout, etag, last_modified)
+            if status == 200:
+                feed, items = parse_feed(body)
+                items.sort(key=lambda item: item["publishedTs"], reverse=True)
+                items = items[: args.max]
+                cache = {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "url": args.url,
+                    "fetchedTs": now,
+                    "etag": headers.get("ETag", "") or headers.get("Etag", ""),
+                    "lastModified": headers.get("Last-Modified", ""),
+                    "feed": feed,
+                    "items": items,
+                }
+                write_json(cache_path(), cache)
+                cache_matches = True
+                source = "network"
+            elif status == 304 and cache_matches:
+                cache["fetchedTs"] = now
+                write_json(cache_path(), cache)
+                source = "network"
+            else:
+                message = "Feed said not-modified but nothing is cached"
+        except Exception as error:  # noqa: BLE001 - reported to the panel
+            message = describe_error(error)
+
+    if cache is None or not cache_matches:
+        emit(error_payload(message or "No cached news yet", args.url, now))
+        return 0 if not message else 1
+
+    if source == "cache" and message:
+        message = "Offline — " + message[0].lower() + message[1:]
+    elif source == "cache" and args.offline:
+        message = ""
+
+    # Read-state bookkeeping. Ids unseen before this run are "new"; the first
+    # run instead seeds everything as known and marks the older posts read.
+    item_ids = [item["id"] for item in cache["items"]]
+    known = set(state["known"])
+    new_ids = []
+    if not state["initialized"] and not known:
+        cutoff = now - FIRST_RUN_UNREAD_DAYS * 86400
+        read = set(state["read"])
+        for item in cache["items"]:
+            if item["publishedTs"] and item["publishedTs"] < cutoff:
+                read.add(item["id"])
+        state["read"] = list(read)
+    else:
+        new_ids = [item_id for item_id in item_ids if item_id not in known]
+    state["known"] = list(dict.fromkeys(state["known"] + item_ids))
+    save_state(state, item_ids)
+
+    emit(build_payload(state, cache, source, message, new_ids, now))
+    return 0
+
+
+def _emit_from_cache(state, message=""):
+    now = int(time.time())
+    cache = load_cache()
+    if cache is None:
+        emit(error_payload("No cached news yet", "", now))
+        return 1
+    save_state(state, [item["id"] for item in cache["items"]])
+    emit(build_payload(state, cache, "cache", message, [], now))
+    return 0
+
+
+def cmd_mark_read(args):
+    state = load_state()
+    read = set(state["read"])
+    read.update(args.ids)
+    state["read"] = list(read)
+    return _emit_from_cache(state)
+
+
+def cmd_mark_unread(args):
+    state = load_state()
+    wanted = set(args.ids)
+    state["read"] = [item_id for item_id in state["read"] if item_id not in wanted]
+    return _emit_from_cache(state)
+
+
+def cmd_mark_all_read(args):
+    state = load_state()
+    cache = load_cache()
+    if cache is not None:
+        state["read"] = list(dict.fromkeys(state["read"] + [item["id"] for item in cache["items"]]))
+    return _emit_from_cache(state)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="omapress", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command")
+
+    fetch = sub.add_parser("fetch", help="fetch the feed and print it as JSON")
+    fetch.add_argument("--url", default=DEFAULT_URL)
+    fetch.add_argument("--max", type=int, default=DEFAULT_MAX_ITEMS)
+    fetch.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    fetch.add_argument("--offline", action="store_true", help="serve the cache without touching the network")
+    fetch.set_defaults(func=cmd_fetch)
+
+    mark_read = sub.add_parser("mark-read", help="mark posts read by id")
+    mark_read.add_argument("ids", nargs="+")
+    mark_read.set_defaults(func=cmd_mark_read)
+
+    mark_unread = sub.add_parser("mark-unread", help="mark posts unread by id")
+    mark_unread.add_argument("ids", nargs="+")
+    mark_unread.set_defaults(func=cmd_mark_unread)
+
+    mark_all = sub.add_parser("mark-all-read", help="mark every cached post read")
+    mark_all.set_defaults(func=cmd_mark_all_read)
+
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 2
+    if getattr(args, "max", None) is not None:
+        args.max = max(1, min(200, args.max))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

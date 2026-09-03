@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.renerocksai.omapress",
+  "name": "Omapress",
+  "version": "0.1.0",
+  "author": "renerocksai",
+  "license": "MIT",
+  "description": "Omarchy news in the bar: read the omarchy.org news feed without leaving the desktop.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omapress",
+    "description": "A newspaper icon that lights up when omarchy.org has fresh news; click for a keyboard-driven reader panel.",
+    "category": "Info",
+    "aliases": [
+      "news",
+      "omarchy news",
+      "rss",
+      "press"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "feedUrl": "https://omarchy.org/news/rss.xml",
+      "refreshIntervalSec": 1800,
+      "maxItems": 30,
+      "notifyNewPosts": true,
+      "unreadColor": "#e5484d",
+      "highlightUnread": true
+    },
+    "schema": [
+      {
+        "key": "feedUrl",
+        "type": "string",
+        "label": "Feed URL",
+        "defaultValue": "https://omarchy.org/news/rss.xml",
+        "description": "Any RSS 2.0 or Atom feed. Defaults to the Omarchy news feed."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 300,
+        "max": 86400,
+        "step": 300,
+        "defaultValue": 1800
+      },
+      {
+        "key": "maxItems",
+        "type": "integer",
+        "label": "Posts to keep",
+        "min": 5,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "notifyNewPosts",
+        "type": "boolean",
+        "label": "Notify on new posts",
+        "defaultValue": true,
+        "description": "Send a desktop notification when a refresh finds posts you have not seen before."
+      },
+      {
+        "key": "highlightUnread",
+        "type": "boolean",
+        "label": "Color the bar icon while there are unread posts",
+        "defaultValue": true
+      },
+      {
+        "key": "unreadColor",
+        "type": "string",
+        "label": "Unread color",
+        "defaultValue": "#e5484d",
+        "description": "Any CSS color for the bar icon and unread markers, or \"theme\" to use the bar's active color."
+      }
+    ]
+  }
+}
