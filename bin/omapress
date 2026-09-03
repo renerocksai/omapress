@@ -92,7 +92,7 @@ MAX_URL_CHARS = 2048
 # On the very first run everything older than this is marked read, so a fresh
 # install shows what's new rather than lighting up for the whole archive.
 FIRST_RUN_UNREAD_DAYS = 14
-USER_AGENT = "omapress/0.1 (+https://github.com/renerocksai/omapress)"
+USER_AGENT = "omapress/0.2 (+https://github.com/renerocksai/omapress)"
 
 NS_CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
 NS_DC = "{http://purl.org/dc/elements/1.1/}"

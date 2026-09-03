@@ -92,7 +92,7 @@ settings UI.
 |---|---|---|
 | `feedUrl` | `https://omarchy.org/news/rss.xml` | any RSS 2.0 or Atom feed |
 | `refreshIntervalSec` | `1800` | 300 to 86400 |
-| `maxItems` | `30` | posts kept, 5 to 100 |
+| `maxItems` | `30` | posts kept, 5 to 50 |
 | `notifyNewPosts` | `true` | desktop notification for posts seen for the first time |
 | `highlightUnread` | `true` | color the bar icon while there are unread posts |
 | `unreadColor` | `#e5484d` | any CSS color, or `theme` for the bar's active color |
@@ -104,7 +104,63 @@ settings UI.
 | `~/.local/state/omapress/state.json` | which post ids are read / known |
 | `~/.cache/omapress/feed.json` | the last successfully fetched feed |
 
-Delete both to start over.
+Delete both to start over. Nothing else is touched: no user configuration,
+no `sudo` or `pkexec`, no systemd units, no installer, no bundled binaries.
+
+## Boundaries
+
+What the plugin will and will not do, since it runs unsandboxed inside
+`omarchy-shell` and reads a feed it does not control.
+
+**Network.** Only the configured feed URL is ever requested, and only over
+https. It and every redirect hop must name a real public host: no
+credentials, no explicit port, no IP literal, no localhost, `.local`,
+`.internal` or private address (checked on the name and on what it resolves
+to). At most five hops. A declared `Content-Length` over 4 MiB is refused
+before a byte is read; the body streams in 64 KiB chunks and one byte over
+the cap is an error, not a truncation. Conditional requests keep a normal
+refresh at a few hundred bytes.
+
+**Time.** Every helper run carries one absolute budget (fetch 40 s, read
+state 10 s) that each socket operation inherits as remaining time, with
+`SIGALRM` as the backstop. The shell watches each run with a deadline five
+seconds past that budget: `TERM` to the helper and its process group, `KILL`
+two seconds later if it is still there, and the run is reported as a timeout.
+
+**Size.** Everything that reaches the panel is bounded: 50 posts, titles 300
+characters, summaries 400, authors 120, links and ids 2048, 200 blocks and
+30 links per post, 30 000 characters of body per post. The helper derives its
+8 MiB output budget from these caps and checks its own output against it; the
+shell refuses anything larger whole and rebuilds every document into the same
+closed shape, dropping unknown fields. Control characters are stripped at
+ingestion. A DTD anywhere in the feed is refused, since entity expansion is
+the one thing a DTD can do to an RSS parser. The cache and state files are
+read under byte caps and re-coerced the same way, so a tampered file cannot
+widen what the panel shows.
+
+**Links.** A link is shown and opened only if it is http or https to a real
+public host under the same rules as the feed; everything else, including
+`javascript:`, `file:`, credentialed and local URLs, is dropped at parse time,
+dropped again when the cache is re-read, and refused once more at the click.
+Opening goes through `xdg-open`. A notification's click-through gets a link
+only if it passes, and its title and body are single-line, capped, and cannot
+start with a dash.
+
+**Files.** The state and cache directories are created 0700, opened
+`O_DIRECTORY|O_NOFOLLOW`, refused if they are symlinks or not owned by the
+user, and held by descriptor for the run. Reads are descriptor-relative,
+no-follow, non-blocking, and accept only a regular, singly-linked file owned by
+the user under the cap. Writes go to a random-named `O_EXCL` 0600 temp file,
+fsync, rename over the entry (which replaces a planted symlink rather than
+following it), then fsync the directory.
+
+**Rendering.** Every string from the feed is drawn with `Text.PlainText`.
+Nothing from the feed is ever interpreted as markup, a path, or a command.
+
+**Surface.** The IPC methods take no arguments. The helper is only ever run
+with a fixed argv the shell builds; its `--source` flag, which reads a local
+file instead of the network, exists for the tests and is never passed by the
+plugin.
 
 ## How it works
 
@@ -118,8 +174,10 @@ helper and holds the result; `Panel.qml` is the bar button and the popup;
 ## Development
 
 ```bash
-tests/helper-test.sh          # helper against the fixture feeds
-node --test tests/model.test.mjs
+tests/helper-test.sh             # helper end to end against fixture feeds, adversarial filesystem cases
+python3 tests/helper_unit.py     # URL policy, redirects, caps, deadline, cache coercion
+node --test tests/model.test.mjs # schema, URL and setting policy, formatting
+tests/watchdog-test.sh           # ProcessWatchdog against a child that ignores TERM
 omarchy plugin validate .
 ```
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.renerocksai.omapress",
   "name": "Omapress",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "renerocksai",
   "license": "MIT",
   "description": "Omarchy news in the bar: read the omarchy.org news feed without leaving the desktop.",
