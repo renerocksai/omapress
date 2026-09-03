@@ -76,6 +76,10 @@ test("notifyText is single-line, clipped, and control-free", () => {
   assert.equal(Model.notifyText("x".repeat(1000)).length, 300)
   assert.equal(Model.notifyText("x".repeat(1000), 50).length, 50)
   assert.equal(Model.notifyText(null), "")
+  assert.equal(Model.notifyText("--exec rm -rf /"), "exec rm -rf /")
+  assert.equal(Model.notifyText("-u critical"), "u critical")
+  assert.equal(Model.notifyText(" - dash - "), "dash -")
+  assert.equal(Model.notifyText("---"), "")
 })
 
 test("safeUrl enforces the link policy at the consumer", () => {

@@ -96,8 +96,11 @@ function cleanUrlish(value) {
   return safeLink(typeof value === "string" ? value.trim() : "")
 }
 
+// A string that becomes a positional argument of omarchy-notification-send.
+// Besides the usual cleaning, it must not start with a dash: the command
+// parses its argv, and a title like "--exec ..." would be read as an option.
 function notifyText(value, limit) {
-  return cleanText(value, limit === undefined ? MAX_NOTIFY_BODY_CHARS : limit)
+  return cleanText(value, limit === undefined ? MAX_NOTIFY_BODY_CHARS : limit).replace(/^[-\s]+/, "")
 }
 
 function coerceBlock(value) {
