@@ -7,10 +7,16 @@ have been read, and prints a single JSON document on stdout.
 
 Standard library only; no third-party modules.
 
-    omapress fetch [--url URL] [--max N] [--timeout SEC] [--offline]
+    omapress [--budget SEC] [--own-process-group] fetch [--url URL] [--max N]
+             [--offline] [--source FILE]
     omapress mark-read ID...
     omapress mark-unread ID...
     omapress mark-all-read
+
+Network policy: the feed URL and every redirect hop must be https, carry no
+credentials, use the default port, and name a public host. Bodies are read
+in bounded chunks under a byte cap. Every run has one absolute deadline
+(--budget) that every socket operation inherits as remaining time.
 
 State lives in $XDG_STATE_HOME/omapress (read/known post ids); the last good
 feed is cached in $XDG_CACHE_HOME/omapress so the panel has something to show
@@ -20,12 +26,17 @@ OMAPRESS_CACHE_DIR, which the tests use.
 
 import argparse
 import email.utils
+import errno
+import ipaddress
 import json
 import os
 import re
+import signal
+import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
@@ -33,7 +44,16 @@ from xml.etree import ElementTree as ET
 SCHEMA_VERSION = 1
 DEFAULT_URL = "https://omarchy.org/news/rss.xml"
 DEFAULT_MAX_ITEMS = 30
-DEFAULT_TIMEOUT = 10
+DEFAULT_BUDGET = 30.0
+MIN_BUDGET = 5.0
+MAX_BUDGET = 600.0
+# One request's socket timeout, capped by what is left of the budget.
+REQUEST_TIMEOUT = 15.0
+# The feed body, on the wire and on disk. omarchy.org's feed is ~50 KiB.
+MAX_FEED_BYTES = 4 * 1024 * 1024
+READ_CHUNK = 64 * 1024
+MAX_REDIRECTS = 5
+MAX_URL_CHARS = 2048
 # On the very first run everything older than this is marked read, so a fresh
 # install shows what's new rather than lighting up for the whole archive.
 FIRST_RUN_UNREAD_DAYS = 14
@@ -42,6 +62,159 @@ USER_AGENT = "omapress/0.1 (+https://github.com/renerocksai/omapress)"
 NS_CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
 NS_DC = "{http://purl.org/dc/elements/1.1/}"
 NS_ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+# ------------------------------------------------------------------ deadline
+
+DEADLINE = float("inf")
+
+
+class Timeout(Exception):
+    """The run's absolute budget is spent."""
+
+
+class Terminated(Exception):
+    """SIGTERM arrived; unwind so `finally` blocks run."""
+
+
+def remaining():
+    return DEADLINE - time.monotonic()
+
+
+def net_timeout(cap=REQUEST_TIMEOUT):
+    left = remaining()
+    if left <= 0:
+        raise Timeout()
+    return max(0.1, min(cap, left))
+
+
+def on_alarm(signum, frame):
+    raise Timeout()
+
+
+def on_terminate(signum, frame):
+    raise Terminated()
+
+
+# ---------------------------------------------------------------- url policy
+
+class UrlError(ValueError):
+    pass
+
+
+_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+_BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa", ".lan")
+
+
+def _is_public_address(address):
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified)
+
+
+def _resolves_publicly(host):
+    """Every address the host resolves to must be public. Resolution failures
+    are left to the request itself so the error message stays meaningful."""
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return True
+    for info in infos:
+        if not _is_public_address(info[4][0]):
+            return False
+    return True
+
+
+def check_url(url, allow_http=False, resolve=True):
+    """Return the URL if it may be requested or opened; raise UrlError if not.
+
+    Rules: https (http too only where the caller says so), a hostname rather
+    than an IP literal, no credentials, no explicit port, no whitespace or
+    control characters, a length cap, and no local or private destination.
+    """
+    value = str(url or "")
+    if not value or len(value) > MAX_URL_CHARS:
+        raise UrlError("URL is empty or too long")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in value):
+        raise UrlError("URL contains whitespace or control characters")
+    parts = urllib.parse.urlsplit(value)
+    scheme = parts.scheme.lower()
+    if scheme != "https" and not (allow_http and scheme == "http"):
+        raise UrlError("URL must use https")
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise UrlError("URL must not carry credentials")
+    try:
+        port = parts.port
+    except ValueError:
+        raise UrlError("URL has an invalid port")
+    if port is not None:
+        raise UrlError("URL must use the default port")
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host:
+        raise UrlError("URL has no host")
+    if host == "localhost" or host.endswith(_BLOCKED_SUFFIXES):
+        raise UrlError("URL points at a local host")
+    if parts.netloc.startswith("[") or _looks_like_ip(host):
+        raise UrlError("URL must name a host, not an address")
+    if not _HOSTNAME_RE.match(host) or "." not in host:
+        raise UrlError("URL host is not a valid public hostname")
+    if resolve and not _resolves_publicly(host):
+        raise UrlError("URL host resolves to a private address")
+    return value
+
+
+def _looks_like_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return bool(re.match(r"^[0-9.]+$", host)) or bool(re.match(r"^0x[0-9a-f]+$", host))
+
+
+class PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validates every hop against the same policy as the first request
+    and caps the chain length."""
+
+    def __init__(self):
+        super().__init__()
+        self.hops = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.hops += 1
+        if self.hops > MAX_REDIRECTS:
+            raise urllib.error.HTTPError(req.full_url, code, "too many redirects", headers, fp)
+        try:
+            check_url(newurl)
+        except UrlError as error:
+            raise urllib.error.HTTPError(req.full_url, code, "redirect refused: %s" % error, headers, fp)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            new.timeout = net_timeout()
+        return new
+
+
+class BodyTooLarge(Exception):
+    pass
+
+
+def read_bounded(stream, limit):
+    """Read at most `limit` bytes; one byte more is an error, not a truncation."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(min(READ_CHUNK, limit - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise BodyTooLarge()
+        chunks.append(chunk)
+        if remaining() <= 0:
+            raise Timeout()
+    return b"".join(chunks)
 
 
 # --------------------------------------------------------------------- paths
@@ -357,32 +530,86 @@ def parse_feed(payload):
 
 # ---------------------------------------------------------------------- fetch
 
-def fetch_url(url, timeout, etag, last_modified):
-    """Returns (status, body_bytes, headers). status is 200, 304, or raises."""
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5"}
+def fetch_url(url, etag, last_modified):
+    """Returns (status, body_bytes, headers). status is 200 or 304, or raises.
+
+    The URL has already passed check_url. The body is streamed under
+    MAX_FEED_BYTES, and a declared Content-Length above it is refused before
+    a byte is read.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5",
+        "Accept-Encoding": "identity",
+    }
     if etag:
         headers["If-None-Match"] = etag
     if last_modified:
         headers["If-Modified-Since"] = last_modified
+    opener = urllib.request.build_opener(PolicyRedirectHandler())
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return 200, response.read(), dict(response.headers)
+        with opener.open(request, timeout=net_timeout()) as response:
+            declared = response.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    if int(declared) > MAX_FEED_BYTES:
+                        raise BodyTooLarge()
+                except ValueError:
+                    pass
+            body = read_bounded(response, MAX_FEED_BYTES)
+            return 200, body, dict(response.headers)
     except urllib.error.HTTPError as error:
         if error.code == 304:
             return 304, b"", dict(error.headers or {})
         raise
 
 
+def read_source_file(path):
+    """A local feed for tests and offline debugging: a regular file under the
+    same byte cap, opened without following symlinks."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise UrlError("source is not a regular file")
+        raise
+    try:
+        info = os.fstat(fd)
+        if not _is_regular(info):
+            raise UrlError("source is not a regular file")
+        if info.st_size > MAX_FEED_BYTES:
+            raise BodyTooLarge()
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return read_bounded(handle, MAX_FEED_BYTES)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _is_regular(info):
+    import stat
+    return stat.S_ISREG(info.st_mode)
+
+
 def describe_error(error):
+    if isinstance(error, UrlError):
+        return "Feed URL refused: %s" % error
+    if isinstance(error, BodyTooLarge):
+        return "Feed is larger than %d MiB" % (MAX_FEED_BYTES // (1024 * 1024))
+    if isinstance(error, Timeout):
+        return "Feed fetch ran out of time"
     if isinstance(error, urllib.error.HTTPError):
+        if error.code in (301, 302, 303, 307, 308) and "refused" in str(error.reason):
+            return "Feed %s" % error.reason
         return "Feed returned HTTP %d" % error.code
     if isinstance(error, urllib.error.URLError):
         reason = getattr(error, "reason", None)
         return "Could not reach the feed (%s)" % (reason if reason else "network error")
     if isinstance(error, ET.ParseError):
         return "Feed is not valid XML (%s)" % error
-    if isinstance(error, TimeoutError):
+    if isinstance(error, (TimeoutError, socket.timeout)):
         return "Feed timed out"
     return str(error) or error.__class__.__name__
 
@@ -472,6 +699,11 @@ def error_payload(message, url, now):
 
 def cmd_fetch(args):
     now = int(time.time())
+    try:
+        check_url(args.url, resolve=not args.offline and not args.source)
+    except UrlError as error:
+        emit(error_payload(describe_error(error), args.url, now))
+        return 1
     state = load_state()
     cache = load_cache()
     cache_matches = cache is not None and cache.get("url") == args.url
@@ -482,7 +714,10 @@ def cmd_fetch(args):
         etag = cache.get("etag", "") if cache_matches else ""
         last_modified = cache.get("lastModified", "") if cache_matches else ""
         try:
-            status, body, headers = fetch_url(args.url, args.timeout, etag, last_modified)
+            if args.source:
+                status, body, headers = 200, read_source_file(args.source), {}
+            else:
+                status, body, headers = fetch_url(args.url, etag, last_modified)
             if status == 200:
                 feed, items = parse_feed(body)
                 items.sort(key=lambda item: item["publishedTs"], reverse=True)
@@ -505,6 +740,8 @@ def cmd_fetch(args):
                 source = "network"
             else:
                 message = "Feed said not-modified but nothing is cached"
+        except (Timeout, Terminated):
+            raise
         except Exception as error:  # noqa: BLE001 - reported to the panel
             message = describe_error(error)
 
@@ -574,13 +811,18 @@ def cmd_mark_all_read(args):
 
 def main(argv):
     parser = argparse.ArgumentParser(prog="omapress", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET,
+                        help="absolute deadline for the whole run in seconds (%d-%d)" % (MIN_BUDGET, MAX_BUDGET))
+    # Lets the caller signal the helper and anything it started as one group.
+    # Off by default so a terminal user's Ctrl+C keeps working as usual.
+    parser.add_argument("--own-process-group", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command")
 
     fetch = sub.add_parser("fetch", help="fetch the feed and print it as JSON")
-    fetch.add_argument("--url", default=DEFAULT_URL)
+    fetch.add_argument("--url", default=DEFAULT_URL, help="https feed URL; also the cache key")
     fetch.add_argument("--max", type=int, default=DEFAULT_MAX_ITEMS)
-    fetch.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     fetch.add_argument("--offline", action="store_true", help="serve the cache without touching the network")
+    fetch.add_argument("--source", default="", help="read the feed from this local file instead of the network")
     fetch.set_defaults(func=cmd_fetch)
 
     mark_read = sub.add_parser("mark-read", help="mark posts read by id")
@@ -600,7 +842,29 @@ def main(argv):
         return 2
     if getattr(args, "max", None) is not None:
         args.max = max(1, min(200, args.max))
-    return args.func(args)
+
+    global DEADLINE
+    budget = max(MIN_BUDGET, min(MAX_BUDGET, float(args.budget) if args.budget == args.budget else DEFAULT_BUDGET))
+    DEADLINE = time.monotonic() + budget
+    if args.own_process_group:
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
+    signal.signal(signal.SIGTERM, on_terminate)
+    signal.signal(signal.SIGALRM, on_alarm)
+    # The alarm is the backstop for code that never consults remaining(),
+    # such as DNS resolution inside getaddrinfo.
+    signal.alarm(int(budget) + 5)
+    try:
+        return args.func(args)
+    except Timeout:
+        emit(error_payload("Feed fetch ran out of time", getattr(args, "url", ""), int(time.time())))
+        return 1
+    except Terminated:
+        return 143
+    finally:
+        signal.alarm(0)
 
 
 if __name__ == "__main__":

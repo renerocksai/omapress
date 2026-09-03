@@ -15,11 +15,12 @@ export OMAPRESS_CACHE_DIR="$work/cache"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
-url="file://$fixture"
+url="https://feed.example.org/rss.xml"
+src() { "$helper" fetch --url "$url" --source "$1"; }
 
 # First run: everything newer than 14 days is unread, nothing is "new".
-out=$("$helper" fetch --url "$url")
-[[ $(field 'd["state"]' <<<"$out") == ready ]] || fail "first fetch not ready"
+out=$(src "$fixture")
+[[ $(field 'd["state"]' <<<"$out") == ready ]] || fail "first fetch not ready: $(field 'd["message"]' <<<"$out")"
 [[ $(field 'd["source"]' <<<"$out") == network ]] || fail "first fetch not from network"
 [[ $(field 'len(d["items"])' <<<"$out") == 3 ]] || fail "expected 3 items"
 [[ $(field 'd["newIds"]' <<<"$out") == "[]" ]] || fail "first run must not report new posts"
@@ -36,13 +37,13 @@ out=$("$helper" fetch --url "$url")
 [[ $(field 'd["unread"]' <<<"$out") == 2 ]] || fail "unread count"
 
 # Second run: still no new posts, served from network (fixture has no ETag).
-out=$("$helper" fetch --url "$url")
+out=$(src "$fixture")
 [[ $(field 'd["newIds"]' <<<"$out") == "[]" ]] || fail "second run reported new posts"
 
 # A post appearing later is new.
 grow="$work/grown.xml"
 sed 's#</channel>#<item><title>Newest</title><link>https://example.org/new</link><guid>https://example.org/new</guid><pubDate>Thu, 03 Sep 2026 10:00:00 GMT</pubDate><description>brand new</description></item></channel>#' "$fixture" > "$grow"
-out=$("$helper" fetch --url "file://$grow")
+out=$(src "$grow")
 [[ $(field 'd["newIds"]' <<<"$out") == "['https://example.org/new']" ]] || fail "new post not detected: $(field 'd["newIds"]' <<<"$out")"
 [[ $(field 'd["items"][0]["title"]' <<<"$out") == Newest ]] || fail "items not sorted newest first"
 [[ $(field 'd["unread"]' <<<"$out") == 3 ]] || fail "unread after growth"
@@ -58,22 +59,46 @@ out=$("$helper" mark-all-read)
 
 # Offline: same URL unreachable, cache serves with an offline message.
 mv "$grow" "$grow.gone"
-out=$("$helper" fetch --url "file://$grow")
+out=$(src "$grow")
 [[ $(field 'd["state"]' <<<"$out") == ready ]] || fail "offline should still be ready from cache"
 [[ $(field 'd["source"]' <<<"$out") == cache ]] || fail "offline source"
 [[ $(field 'd["message"].startswith("Offline")' <<<"$out") == True ]] || fail "offline message: $(field 'd["message"]' <<<"$out")"
 [[ $(field 'len(d["items"])' <<<"$out") == 4 ]] || fail "offline items"
 
 # --offline never touches the network and reports no error.
-out=$("$helper" fetch --offline --url "file://$grow")
+out=$("$helper" fetch --offline --url "$url")
 [[ $(field 'd["message"]' <<<"$out") == "" ]] || fail "--offline should be quiet"
 
 # A different URL with nothing cached is an error, exit 1.
-if out=$("$helper" fetch --url "file://$work/missing.xml" 2>/dev/null); then fail "missing feed should exit non-zero"; fi
+if out=$("$helper" fetch --url "https://other.example.org/feed.xml" --source "$work/missing.xml" 2>/dev/null); then fail "missing feed should exit non-zero"; fi
 [[ $(field 'd["state"]' <<<"$out") == error ]] || fail "missing feed state"
 
+# URL policy at the entry point: refused before any state is touched.
+for bad in "http://omarchy.org/news/rss.xml" "https://user:pw@omarchy.org/rss.xml" "https://omarchy.org:8443/rss.xml" \
+           "https://localhost/rss.xml" "https://127.0.0.1/rss.xml" "https://[::1]/rss.xml" "https://10.0.0.5/rss.xml" \
+           "file:///etc/passwd" "https://omarchy.org/r ss.xml" "https://feed.local/rss.xml" "ftp://omarchy.org/x"; do
+  if out=$("$helper" fetch --url "$bad" --source "$fixture" 2>/dev/null); then fail "accepted bad URL $bad"; fi
+  [[ $(field 'd["state"]' <<<"$out") == error ]] || fail "bad URL not an error: $bad"
+  [[ $(field 'd["message"].startswith("Feed URL refused")' <<<"$out") == True ]] || fail "bad URL message: $bad -> $(field 'd["message"]' <<<"$out")"
+done
+
+# An oversized source is refused, not truncated.
+python3 -c 'import sys; sys.stdout.write("<rss><channel>" + "<item><title>x</title><guid>g</guid></item>" * 120000 + "</channel></rss>")' > "$work/huge.xml"
+out=$("$helper" fetch --url "https://huge.example.org/rss.xml" --source "$work/huge.xml" 2>/dev/null || true)
+[[ $(field 'd["message"]' <<<"$out") == "Feed is larger than 4 MiB" ]] || fail "oversize: $(field 'd["message"]' <<<"$out")"
+
+# A symlinked source is refused.
+ln -s "$fixture" "$work/link.xml"
+out=$("$helper" fetch --url "https://link.example.org/rss.xml" --source "$work/link.xml" 2>/dev/null || true)
+[[ $(field 'd["message"]' <<<"$out") == "Feed URL refused: source is not a regular file" ]] || fail "symlink source: $(field 'd["message"]' <<<"$out")"
+
+# A FIFO is not a regular file either, and must not block the run.
+mkfifo "$work/pipe.xml"
+out=$("$helper" fetch --url "https://pipe.example.org/rss.xml" --source "$work/pipe.xml" 2>/dev/null || true)
+[[ $(field 'd["message"]' <<<"$out") == "Feed URL refused: source is not a regular file" ]] || fail "fifo source: $(field 'd["message"]' <<<"$out")"
+
 # Atom feeds parse too.
-out=$("$helper" fetch --url "file://$here/fixtures/feed.atom")
+out=$("$helper" fetch --url "https://atom.example.org/feed.atom" --source "$here/fixtures/feed.atom")
 [[ $(field 'd["feed"]["title"]' <<<"$out") == "Atom Example" ]] || fail "atom title"
 [[ $(field 'd["items"][0]["link"]' <<<"$out") == "https://example.org/atom-1" ]] || fail "atom link"
 [[ $(field 'd["items"][0]["author"]' <<<"$out") == "Ada" ]] || fail "atom author"
