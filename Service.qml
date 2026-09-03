@@ -38,7 +38,21 @@ Item {
   readonly property string feedLink: Model.safeLink(feed && feed.link ? feed.link : "") || "https://omarchy.org/news"
 
   // Resolve the helper next to this file so a clone runs its own copy.
-  readonly property string helperPath: String(Qt.resolvedUrl("bin/omapress")).replace(/^file:\/\//, "")
+  // resolvedUrl percent-encodes; argv wants the bytes.
+  readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("bin/omapress")).replace(/^file:\/\//, ""))
+
+  // Deadlines. The helper gets a --budget a few seconds under the QML
+  // deadline so it unwinds on its own (running its cleanup) before the
+  // watchdog ever has to signal it; --own-process-group lets one group
+  // signal take the helper and anything it started down together.
+  readonly property int fetchTimeoutMs: 45000
+  readonly property int markTimeoutMs: 15000
+  readonly property int maxQueuedMarks: 32
+
+  function helperArgv(args, timeoutMs) {
+    var budget = Math.max(5, Math.round(timeoutMs / 1000) - 5)
+    return ["python3", helperPath, "--budget", String(budget), "--own-process-group"].concat(args)
+  }
 
   signal itemsReplaced()
 
@@ -70,9 +84,14 @@ Item {
       return
     }
     refreshing = true
-    fetchProcess.command = ["python3", helperPath, "fetch", "--url", feedUrl, "--max", String(maxItems)]
+    fetchTimedOut = false
+    fetchProcess.command = helperArgv(["fetch", "--url", feedUrl, "--max", String(maxItems)], fetchTimeoutMs)
     fetchProcess.running = true
+    watchdog.watch(fetchProcess, "Feed fetch", fetchTimeoutMs)
   }
+
+  property bool fetchTimedOut: false
+  property bool markTimedOut: false
 
   // Refresh only when the last fetch is older than `maxAgeSec`; used on
   // panel open so a click never spams the server.
@@ -139,11 +158,18 @@ Item {
 
   function runMark(args) {
     if (markProcess.running) {
+      if (_markQueue.length >= maxQueuedMarks) {
+        actionStatus = "Too many pending changes; try again in a moment"
+        actionStatusTimer.restart()
+        return
+      }
       _markQueue = _markQueue.concat([args])
       return
     }
-    markProcess.command = ["python3", helperPath].concat(args)
+    markTimedOut = false
+    markProcess.command = helperArgv(args, markTimeoutMs)
     markProcess.running = true
+    watchdog.watch(markProcess, "Saving read state", markTimeoutMs)
   }
 
   // The one path to the browser. Re-checked here even though the helper
@@ -242,6 +268,19 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
+  ProcessWatchdog {
+    id: watchdog
+    onTimedOut: function(proc, label) {
+      if (proc === fetchProcess) root.fetchTimedOut = true
+      else if (proc === markProcess) root.markTimedOut = true
+    }
+  }
+
+  Component.onDestruction: watchdog.terminateAll()
+
+  // StdioCollector cannot be capped from QML; the producer caps itself
+  // (bin/omapress emit()) and parsePayload refuses anything over the same
+  // budget, so an over-budget document is dropped, never parsed.
   Process {
     id: fetchProcess
     running: false
@@ -249,7 +288,13 @@ Item {
     stdout: StdioCollector { id: fetchStdout; waitForEnd: true }
     stderr: StdioCollector { id: fetchStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      watchdog.forget(fetchProcess)
       root.refreshing = false
+      if (root.fetchTimedOut) {
+        if (!root.everLoaded) root.state = "error"
+        root.message = "Feed fetch timed out"
+        return
+      }
       var out = String(fetchStdout.text || "")
       var err = String(fetchStderr.text || "")
       if (out.trim() !== "") {
@@ -269,8 +314,12 @@ Item {
     stdout: StdioCollector { id: markStdout; waitForEnd: true }
     stderr: StdioCollector { id: markStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      watchdog.forget(markProcess)
       var out = String(markStdout.text || "")
-      if (exitCode === 0 && out.trim() !== "") {
+      if (root.markTimedOut) {
+        root.actionStatus = "Saving read state timed out"
+        actionStatusTimer.restart()
+      } else if (exitCode === 0 && out.trim() !== "") {
         root.applyPayload(out, false)
       } else {
         root.actionStatus = root.elide(String(markStderr.text || "") || "Could not save read state")
