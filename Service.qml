@@ -25,10 +25,11 @@ Item {
 
   readonly property string feedUrl: String(setting("feedUrl", "https://omarchy.org/news/rss.xml")).trim() || "https://omarchy.org/news/rss.xml"
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 1800, 300, 86400)
-  readonly property int maxItems: intSetting("maxItems", 30, 5, 100)
+  readonly property int maxItems: intSetting("maxItems", 30, 5, Model.MAX_ITEMS)
   readonly property bool notifyNewPosts: boolSetting("notifyNewPosts", true)
   readonly property bool busy: fetchProcess.running || markProcess.running
   readonly property string feedTitle: String(feed && feed.title ? feed.title : "") || "Omarchy News"
+  readonly property int maxPayloadChars: Model.MAX_PAYLOAD_CHARS
   readonly property string feedLink: String(feed && feed.link ? feed.link : "") || "https://omarchy.org/news"
 
   // Resolve the helper next to this file so a clone runs its own copy.
@@ -179,14 +180,14 @@ Item {
     if (picks.length === 0) return
     if (total > picks.length) {
       Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Omapress", "-g", "\uf1ea", "-u", "low",
-        total + " new posts on " + feedTitle, "Open the news panel to catch up",
+        total + " new posts on " + Model.notifyText(feedTitle, 120), "Open the news panel to catch up",
         "--exec", "omarchy-shell", "shell", "summon", "io.github.renerocksai.omapress", "{}"])
       return
     }
     for (var j = 0; j < picks.length; j++) {
       var pick = picks[j]
       var args = ["omarchy-notification-send", "--app-name", "Omapress", "-g", "\uf1ea", "-u", "low",
-        String(pick.title || "New post"), String(pick.summary || feedTitle)]
+        Model.notifyText(pick.title, 200) || "New post", Model.notifyText(pick.summary) || Model.notifyText(feedTitle, 120)]
       if (/^https?:\/\//.test(String(pick.link || ""))) args = args.concat(["--exec", "xdg-open", String(pick.link)])
       Quickshell.execDetached(args)
     }

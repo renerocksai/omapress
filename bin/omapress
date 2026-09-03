@@ -44,6 +44,36 @@ from xml.etree import ElementTree as ET
 SCHEMA_VERSION = 1
 DEFAULT_URL = "https://omarchy.org/news/rss.xml"
 DEFAULT_MAX_ITEMS = 30
+
+# ---------------------------------------------------------------- output caps
+#
+# Everything the helper prints is bounded by these, and the payload budget is
+# derived from them rather than chosen beside them, so a run cannot emit past
+# the ceiling the QML side enforces (Model.js MAX_PAYLOAD_CHARS). emit()
+# checks the serialised size against the budget as a final guard.
+MAX_ITEMS = 50
+MAX_ID_CHARS = 2048
+MAX_TITLE_CHARS = 300
+MAX_AUTHOR_CHARS = 120
+MAX_SUMMARY_CHARS = 400
+MAX_BLOCKS_PER_ITEM = 200
+MAX_BLOCK_CHARS = 4000
+MAX_BODY_CHARS = 30000          # all blocks of one post together
+MAX_LINKS_PER_ITEM = 30
+MAX_LINK_TEXT_CHARS = 200
+MAX_FEED_TITLE_CHARS = 200
+MAX_FEED_DESC_CHARS = 400
+MAX_MESSAGE_CHARS = 300
+MAX_MARK_IDS = 50               # ids one mark command accepts
+MAX_STATE_IDS = 500             # read/known ids kept per list
+JSON_OVERHEAD_FACTOR = 1.25     # keys, quotes, escapes
+_ITEM_WORST = (MAX_ID_CHARS + MAX_TITLE_CHARS + MAX_ID_CHARS + MAX_AUTHOR_CHARS
+               + MAX_SUMMARY_CHARS + MAX_BODY_CHARS
+               + MAX_LINKS_PER_ITEM * (MAX_LINK_TEXT_CHARS + MAX_ID_CHARS))
+MAX_PAYLOAD_CHARS = 8 * 1024 * 1024
+assert int(MAX_ITEMS * _ITEM_WORST * JSON_OVERHEAD_FACTOR) + 64 * 1024 < MAX_PAYLOAD_CHARS
+MAX_STATE_BYTES = 512 * 1024
+MAX_CACHE_BYTES = MAX_PAYLOAD_CHARS
 DEFAULT_BUDGET = 30.0
 MIN_BUDGET = 5.0
 MAX_BUDGET = 600.0
@@ -217,6 +247,33 @@ def read_bounded(stream, limit):
     return b"".join(chunks)
 
 
+# ----------------------------------------------------------------- text caps
+
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def clean_text(value, limit, keep_newlines=False):
+    """Control characters out, whitespace normalised, clipped to `limit`."""
+    text = _CONTROL_RE.sub("", str(value or ""))
+    if keep_newlines:
+        lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in text.split("\n")]
+        text = "\n".join(line for line in lines if line != "")
+    else:
+        text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def clean_id(value, limit=MAX_ID_CHARS):
+    """An id is opaque: no whitespace or control characters, length-capped,
+    and never clipped (a clipped id would silently alias another)."""
+    text = str(value or "")
+    if text == "" or len(text) > limit or any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in text):
+        return ""
+    return text
+
+
 # --------------------------------------------------------------------- paths
 
 def _xdg(env, fallback):
@@ -242,12 +299,14 @@ def cache_path():
     return os.path.join(cache_dir(), "feed.json")
 
 
-def read_json(path, fallback):
+def read_json(path, fallback, limit):
+    """A dict from a JSON file no larger than `limit` bytes, else fallback."""
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        with open(path, "rb") as handle:
+            raw = read_bounded(handle, limit)
+        data = json.loads(raw.decode("utf-8"))
         return data if isinstance(data, dict) else fallback
-    except (OSError, ValueError):
+    except (OSError, ValueError, BodyTooLarge, UnicodeDecodeError):
         return fallback
 
 
@@ -282,10 +341,16 @@ class BlockParser(HTMLParser):
         self.links = []
         self._seen_links = set()
         self._buf = []
+        self._buf_chars = 0
+        self._body_chars = 0
         self._stack = []
         self._skip = 0
         self._link_text = None
         self._link_href = ""
+
+    @property
+    def full(self):
+        return len(self.blocks) >= MAX_BLOCKS_PER_ITEM or self._body_chars >= MAX_BODY_CHARS
 
     # ---- helpers
     def _kind(self):
@@ -303,18 +368,33 @@ class BlockParser(HTMLParser):
     def _flush(self):
         text = "".join(self._buf)
         self._buf = []
+        self._buf_chars = 0
+        if self.full:
+            return
         kind = self._kind()
         if kind == "code":
-            text = text.strip("\n")
+            text = _CONTROL_RE.sub("", text).strip("\n")
             if text.strip() == "":
                 return
+            if len(text) > MAX_BLOCK_CHARS:
+                text = text[: MAX_BLOCK_CHARS - 1] + "…"
         else:
-            # Collapse whitespace but keep explicit line breaks from <br>.
-            lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in text.split("\n")]
-            text = "\n".join(line for line in lines if line != "")
+            text = clean_text(text, MAX_BLOCK_CHARS, keep_newlines=True)
             if text == "":
                 return
+        room = MAX_BODY_CHARS - self._body_chars
+        if len(text) > room:
+            text = text[: max(0, room - 1)].rstrip() + "…"
+        self._body_chars += len(text)
         self.blocks.append({"kind": kind, "text": text})
+
+    def _append(self, data):
+        # Past the per-block cap the text is going to be clipped anyway, so
+        # stop buffering it: a single enormous text node must not grow memory.
+        if self._buf_chars >= MAX_BLOCK_CHARS + 16:
+            return
+        self._buf.append(data)
+        self._buf_chars += len(data)
 
     # ---- parser callbacks
     def handle_starttag(self, tag, attrs):
@@ -329,7 +409,7 @@ class BlockParser(HTMLParser):
                 self._stack.append(tag)
             return
         if tag == "br":
-            self._buf.append("\n")
+            self._append("\n")
             return
         if tag == "a":
             href = ""
@@ -345,7 +425,7 @@ class BlockParser(HTMLParser):
                 if name == "alt" and value:
                     alt = value.strip()
             if alt:
-                self._buf.append("[" + alt + "]")
+                self._append("[" + clean_text(alt, MAX_LINK_TEXT_CHARS) + "]")
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
@@ -373,17 +453,19 @@ class BlockParser(HTMLParser):
             href = self._link_href
             self._link_text = None
             self._link_href = ""
+            if len(self.links) >= MAX_LINKS_PER_ITEM or len(href) > MAX_ID_CHARS:
+                return
             if href and href.startswith(("http://", "https://")):
                 key = href.rstrip("/")
                 if key not in self._seen_links:
                     self._seen_links.add(key)
-                    self.links.append({"text": re.sub(r"\s+", " ", text) or href, "href": href})
+                    self.links.append({"text": clean_text(text, MAX_LINK_TEXT_CHARS) or href, "href": href})
 
     def handle_data(self, data):
-        if self._skip:
+        if self._skip or self.full:
             return
-        self._buf.append(data)
-        if self._link_text is not None:
+        self._append(data)
+        if self._link_text is not None and sum(len(part) for part in self._link_text) < MAX_LINK_TEXT_CHARS + 16:
             self._link_text.append(data)
 
     def close(self):
@@ -398,8 +480,7 @@ def html_to_blocks(markup):
         parser.feed(markup or "")
         parser.close()
     except Exception:  # noqa: BLE001 - never let a weird post kill the feed
-        text = re.sub(r"<[^>]+>", " ", markup or "")
-        text = re.sub(r"\s+", " ", text).strip()
+        text = clean_text(re.sub(r"<[^>]+>", " ", markup or ""), MAX_BLOCK_CHARS)
         return ([{"kind": "p", "text": text}] if text else []), []
     return parser.blocks, parser.links
 
@@ -410,7 +491,7 @@ def html_to_text(markup):
 
 
 def summarize(text, limit=220):
-    text = re.sub(r"\s+", " ", text or "").strip()
+    text = clean_text(text, MAX_SUMMARY_CHARS * 4)
     if len(text) <= limit:
         return text
     cut = text[:limit]
@@ -453,28 +534,41 @@ def _parse_date(value):
 
 
 def _build_item(item_id, title, link, author, published_ts, summary_html, body_html):
+    item_id = clean_id(item_id)
+    if not item_id:
+        return None
     blocks, links = html_to_blocks(body_html or summary_html)
     summary = summarize(html_to_text(summary_html) or (blocks[0]["text"] if blocks else ""))
+    link = str(link or "").strip()
+    if len(link) > MAX_ID_CHARS:
+        link = ""
     return {
         "id": item_id,
-        "title": re.sub(r"\s+", " ", title or "Untitled").strip(),
+        "title": clean_text(title, MAX_TITLE_CHARS) or "Untitled",
         "link": link,
-        "author": author,
-        "publishedTs": published_ts,
-        "summary": summary,
-        "blocks": blocks,
-        "links": links,
+        "author": clean_text(author, MAX_AUTHOR_CHARS),
+        "publishedTs": max(0, min(4102444800, int(published_ts or 0))),
+        "summary": clean_text(summary, MAX_SUMMARY_CHARS),
+        "blocks": blocks[:MAX_BLOCKS_PER_ITEM],
+        "links": links[:MAX_LINKS_PER_ITEM],
+    }
+
+
+def _feed_info(title, link, description):
+    link = str(link or "").strip()
+    return {
+        "title": clean_text(title, MAX_FEED_TITLE_CHARS),
+        "link": link if len(link) <= MAX_ID_CHARS else "",
+        "description": clean_text(description, MAX_FEED_DESC_CHARS),
     }
 
 
 def parse_rss_channel(channel):
-    feed = {
-        "title": _text(channel, "title"),
-        "link": _text(channel, "link"),
-        "description": _text(channel, "description"),
-    }
+    feed = _feed_info(_text(channel, "title"), _text(channel, "link"), _text(channel, "description"))
     items = []
     for node in channel.findall("item"):
+        if len(items) >= MAX_ITEMS * 4:
+            break
         link = _text(node, "link")
         guid = _text(node, "guid") or link
         if not guid:
@@ -484,22 +578,23 @@ def parse_rss_channel(channel):
         published = _parse_date(_text(node, "pubDate", NS_DC + "date"))
         description = _text(node, "description")
         content = _text(node, NS_CONTENT + "encoded")
-        items.append(_build_item(guid, title, link, author, published, description, content))
+        item = _build_item(guid, title, link, author, published, description, content)
+        if item is not None:
+            items.append(item)
     return feed, items
 
 
 def parse_atom(root):
-    feed = {
-        "title": _text(root, NS_ATOM + "title"),
-        "link": "",
-        "description": _text(root, NS_ATOM + "subtitle"),
-    }
+    feed_link = ""
     for link in root.findall(NS_ATOM + "link"):
         if link.get("rel", "alternate") == "alternate" and link.get("href"):
-            feed["link"] = link.get("href")
+            feed_link = link.get("href")
             break
+    feed = _feed_info(_text(root, NS_ATOM + "title"), feed_link, _text(root, NS_ATOM + "subtitle"))
     items = []
     for entry in root.findall(NS_ATOM + "entry"):
+        if len(items) >= MAX_ITEMS * 4:
+            break
         link = ""
         for candidate in entry.findall(NS_ATOM + "link"):
             if candidate.get("rel", "alternate") == "alternate" and candidate.get("href"):
@@ -513,11 +608,24 @@ def parse_atom(root):
         published = _parse_date(_text(entry, NS_ATOM + "published", NS_ATOM + "updated"))
         summary = _text(entry, NS_ATOM + "summary")
         content = _text(entry, NS_ATOM + "content")
-        items.append(_build_item(entry_id, title, link, author, published, summary, content))
+        item = _build_item(entry_id, title, link, author, published, summary, content)
+        if item is not None:
+            items.append(item)
     return feed, items
 
 
+class FeedRejected(Exception):
+    pass
+
+
+_DTD_RE = re.compile(rb"<!\s*(DOCTYPE|ENTITY)", re.IGNORECASE)
+
+
 def parse_feed(payload):
+    # A feed never needs a DTD; the only thing one can do here is entity
+    # expansion, which the stdlib parser does not bound.
+    if _DTD_RE.search(payload):
+        raise FeedRejected("Feed carries a DTD")
     root = ET.fromstring(payload)
     if root.tag == NS_ATOM + "feed":
         return parse_atom(root)
@@ -596,6 +704,8 @@ def _is_regular(info):
 def describe_error(error):
     if isinstance(error, UrlError):
         return "Feed URL refused: %s" % error
+    if isinstance(error, FeedRejected):
+        return str(error)
     if isinstance(error, BodyTooLarge):
         return "Feed is larger than %d MiB" % (MAX_FEED_BYTES // (1024 * 1024))
     if isinstance(error, Timeout):
@@ -616,12 +726,24 @@ def describe_error(error):
 
 # ---------------------------------------------------------------------- state
 
+def _id_list(value, limit):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for entry in value[-limit * 2:]:
+        if isinstance(entry, str):
+            cleaned = clean_id(entry)
+            if cleaned:
+                out.append(cleaned)
+    return out[-limit:]
+
+
 def load_state():
-    state = read_json(state_path(), {})
+    state = read_json(state_path(), {}, MAX_STATE_BYTES)
     return {
         "schemaVersion": SCHEMA_VERSION,
-        "read": list(state.get("read", [])) if isinstance(state.get("read"), list) else [],
-        "known": list(state.get("known", [])) if isinstance(state.get("known"), list) else [],
+        "read": _id_list(state.get("read"), MAX_STATE_IDS),
+        "known": _id_list(state.get("known"), MAX_STATE_IDS),
         "initialized": bool(state.get("initialized", False)),
     }
 
@@ -633,8 +755,8 @@ def save_state(state, item_ids):
 
     def prune(values):
         kept = [value for value in values if value in keep]
-        tail = [value for value in values if value not in keep][-500:]
-        return kept + tail
+        tail = [value for value in values if value not in keep]
+        return (kept + tail[-(MAX_STATE_IDS - len(kept)):])[:MAX_STATE_IDS] if len(kept) < MAX_STATE_IDS else kept[:MAX_STATE_IDS]
 
     write_json(state_path(), {
         "schemaVersion": SCHEMA_VERSION,
@@ -644,15 +766,113 @@ def save_state(state, item_ids):
     })
 
 
-def load_cache():
-    cache = read_json(cache_path(), {})
-    if not isinstance(cache.get("items"), list):
+def coerce_block(value):
+    if not isinstance(value, dict):
         return None
-    return cache
+    kind = value.get("kind")
+    if kind not in ("p", "heading", "item", "quote", "code"):
+        kind = "p"
+    text = value.get("text")
+    if not isinstance(text, str):
+        return None
+    text = _CONTROL_RE.sub("", text)
+    if len(text) > MAX_BLOCK_CHARS:
+        text = text[: MAX_BLOCK_CHARS - 1] + "…"
+    return {"kind": kind, "text": text} if text.strip() else None
+
+
+def coerce_link(value):
+    if not isinstance(value, dict) or not isinstance(value.get("href"), str):
+        return None
+    href = value["href"].strip()
+    if not href or len(href) > MAX_ID_CHARS:
+        return None
+    return {"text": clean_text(value.get("text"), MAX_LINK_TEXT_CHARS) or href, "href": href}
+
+
+def coerce_item(value):
+    """A cached item is re-read through the same closed shape a parsed one
+    has, so a tampered or stale cache cannot widen what reaches the panel."""
+    if not isinstance(value, dict):
+        return None
+    item_id = clean_id(value.get("id"))
+    if not item_id:
+        return None
+    blocks = []
+    body = 0
+    for block in (value.get("blocks") if isinstance(value.get("blocks"), list) else [])[:MAX_BLOCKS_PER_ITEM]:
+        coerced = coerce_block(block)
+        if coerced is None:
+            continue
+        room = MAX_BODY_CHARS - body
+        if room <= 0:
+            break
+        if len(coerced["text"]) > room:
+            coerced["text"] = coerced["text"][: max(0, room - 1)] + "…"
+        body += len(coerced["text"])
+        blocks.append(coerced)
+    links = [link for link in (coerce_link(entry) for entry in (value.get("links") if isinstance(value.get("links"), list) else [])[:MAX_LINKS_PER_ITEM]) if link]
+    link = value.get("link") if isinstance(value.get("link"), str) else ""
+    try:
+        published = int(value.get("publishedTs") or 0)
+    except (TypeError, ValueError):
+        published = 0
+    return {
+        "id": item_id,
+        "title": clean_text(value.get("title"), MAX_TITLE_CHARS) or "Untitled",
+        "link": link.strip() if len(link) <= MAX_ID_CHARS else "",
+        "author": clean_text(value.get("author"), MAX_AUTHOR_CHARS),
+        "publishedTs": max(0, min(4102444800, published)),
+        "summary": clean_text(value.get("summary"), MAX_SUMMARY_CHARS),
+        "blocks": blocks,
+        "links": links,
+    }
+
+
+def coerce_cache(value):
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        return None
+    items = []
+    seen = set()
+    for entry in value["items"]:
+        if len(items) >= MAX_ITEMS:
+            break
+        item = coerce_item(entry)
+        if item is not None and item["id"] not in seen:
+            seen.add(item["id"])
+            items.append(item)
+    feed = value.get("feed") if isinstance(value.get("feed"), dict) else {}
+    try:
+        fetched = int(value.get("fetchedTs") or 0)
+    except (TypeError, ValueError):
+        fetched = 0
+    url = value.get("url") if isinstance(value.get("url"), str) else ""
+    etag = value.get("etag") if isinstance(value.get("etag"), str) else ""
+    last_modified = value.get("lastModified") if isinstance(value.get("lastModified"), str) else ""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "url": url if len(url) <= MAX_URL_CHARS else "",
+        "fetchedTs": max(0, fetched),
+        "etag": clean_text(etag, 256),
+        "lastModified": clean_text(last_modified, 64),
+        "feed": _feed_info(feed.get("title"), feed.get("link"), feed.get("description")),
+        "items": items,
+    }
+
+
+def load_cache():
+    return coerce_cache(read_json(cache_path(), {}, MAX_CACHE_BYTES))
 
 
 def emit(payload):
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    if isinstance(payload.get("message"), str):
+        payload["message"] = clean_text(payload["message"], MAX_MESSAGE_CHARS)
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) > MAX_PAYLOAD_CHARS:
+        # Cannot happen by construction (see the caps above); refuse rather
+        # than hand the shell something larger than it will accept.
+        text = json.dumps(error_payload("Feed payload exceeds the output budget", str(payload.get("url", "")), int(time.time())))
+    sys.stdout.write(text)
     sys.stdout.write("\n")
 
 
@@ -675,7 +895,7 @@ def build_payload(state, cache, source, message, new_ids, now):
         "feed": cache.get("feed", {}),
         "items": items,
         "unread": unread,
-        "newIds": new_ids,
+        "newIds": new_ids[:MAX_ITEMS],
     }
 
 
@@ -786,17 +1006,40 @@ def _emit_from_cache(state, message=""):
     return 0
 
 
+def _mark_ids(values):
+    """The ids a mark command may touch: bounded in count and shape, and only
+    ids the cache actually holds, so the state file cannot be grown with junk."""
+    if len(values) > MAX_MARK_IDS:
+        return None
+    cache = load_cache()
+    known = {item["id"] for item in cache["items"]} if cache else set()
+    ids = []
+    for value in values:
+        cleaned = clean_id(value)
+        if not cleaned:
+            return None
+        if cleaned in known:
+            ids.append(cleaned)
+    return ids
+
+
 def cmd_mark_read(args):
+    ids = _mark_ids(args.ids)
+    if ids is None:
+        emit(error_payload("Invalid post id", "", int(time.time())))
+        return 2
     state = load_state()
-    read = set(state["read"])
-    read.update(args.ids)
-    state["read"] = list(read)
+    state["read"] = list(dict.fromkeys(state["read"] + ids))
     return _emit_from_cache(state)
 
 
 def cmd_mark_unread(args):
+    ids = _mark_ids(args.ids)
+    if ids is None:
+        emit(error_payload("Invalid post id", "", int(time.time())))
+        return 2
     state = load_state()
-    wanted = set(args.ids)
+    wanted = set(ids)
     state["read"] = [item_id for item_id in state["read"] if item_id not in wanted]
     return _emit_from_cache(state)
 
@@ -841,7 +1084,7 @@ def main(argv):
         parser.print_help()
         return 2
     if getattr(args, "max", None) is not None:
-        args.max = max(1, min(200, args.max))
+        args.max = max(1, min(MAX_ITEMS, args.max))
 
     global DEADLINE
     budget = max(MIN_BUDGET, min(MAX_BUDGET, float(args.budget) if args.budget == args.budget else DEFAULT_BUDGET))

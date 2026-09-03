@@ -57,6 +57,14 @@ out=$("$helper" mark-unread https://example.org/new)
 out=$("$helper" mark-all-read)
 [[ $(field 'd["unread"]' <<<"$out") == 0 ]] || fail "mark-all-read"
 
+# Mark commands accept only well-formed ids the cache holds, and not too many.
+if "$helper" mark-read "has space" >/dev/null 2>&1; then fail "mark-read accepted an id with whitespace"; fi
+if "$helper" mark-read $(printf 'x%.0s ' $(seq 1 60)) >/dev/null 2>&1; then fail "mark-read accepted 60 ids"; fi
+out=$("$helper" mark-unread https://example.org/not-in-feed https://example.org/new)
+[[ $(field 'd["unread"]' <<<"$out") == 1 ]] || fail "unknown id should be ignored, known one applied"
+python3 -c 'import json,sys,os; p=os.path.join(os.environ["OMAPRESS_STATE_DIR"],"state.json"); d=json.load(open(p)); assert "https://example.org/not-in-feed" not in d["read"] and "https://example.org/not-in-feed" not in d["known"]' || fail "unknown id leaked into state"
+"$helper" mark-read https://example.org/new >/dev/null
+
 # Offline: same URL unreachable, cache serves with an offline message.
 mv "$grow" "$grow.gone"
 out=$(src "$grow")

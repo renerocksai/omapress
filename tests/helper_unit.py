@@ -167,5 +167,101 @@ class BoundedRead(unittest.TestCase):
         self.assertGreaterEqual(stream.calls, 3)
 
 
+class Caps(unittest.TestCase):
+    def rss(self, items_xml, channel_extra=""):
+        return ('<?xml version="1.0"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">'
+                "<channel><title>T</title>" + channel_extra + items_xml + "</channel></rss>").encode("utf-8")
+
+    def item(self, guid="g1", title="t", body="<p>b</p>", link="https://x.example/p"):
+        return ("<item><title>%s</title><guid>%s</guid><link>%s</link>"
+                "<content:encoded><![CDATA[%s]]></content:encoded></item>" % (title, guid, link, body))
+
+    def test_title_and_author_clipped_and_cleaned(self):
+        # U+0085 is a C1 control XML 1.0 still allows through; C0 ones it rejects itself.
+        feed, items = om.parse_feed(self.rss(self.item(title="a" * 1000 + "\u0085b")))
+        self.assertEqual(len(items[0]["title"]), om.MAX_TITLE_CHARS)
+        self.assertTrue(items[0]["title"].endswith("…"))
+        feed, items = om.parse_feed(self.rss(self.item(title="a\u0085b")))
+        self.assertEqual(items[0]["title"], "ab")
+
+    def test_block_count_and_body_caps(self):
+        body = "".join("<p>%d para</p>" % i for i in range(om.MAX_BLOCKS_PER_ITEM * 3))
+        feed, items = om.parse_feed(self.rss(self.item(body=body)))
+        self.assertEqual(len(items[0]["blocks"]), om.MAX_BLOCKS_PER_ITEM)
+        body = "<p>" + "x" * (om.MAX_BODY_CHARS * 2) + "</p>" + "<p>after</p>"
+        feed, items = om.parse_feed(self.rss(self.item(body=body)))
+        total = sum(len(b["text"]) for b in items[0]["blocks"])
+        self.assertLessEqual(total, om.MAX_BODY_CHARS)
+        self.assertLessEqual(len(items[0]["blocks"][0]["text"]), om.MAX_BLOCK_CHARS)
+
+    def test_link_caps(self):
+        body = "".join('<a href="https://x.example/%d">%s</a>' % (i, "l" * 500) for i in range(200))
+        feed, items = om.parse_feed(self.rss(self.item(body=body)))
+        self.assertEqual(len(items[0]["links"]), om.MAX_LINKS_PER_ITEM)
+        self.assertEqual(len(items[0]["links"][0]["text"]), om.MAX_LINK_TEXT_CHARS)
+        body = '<a href="https://x.example/%s">long</a>' % ("q" * 5000)
+        feed, items = om.parse_feed(self.rss(self.item(body=body)))
+        self.assertEqual(items[0]["links"], [])
+
+    def test_bad_ids_are_dropped_not_clipped(self):
+        feed, items = om.parse_feed(self.rss(self.item(guid="g" * 5000) + self.item(guid="has space") + self.item(guid="ok")))
+        self.assertEqual([i["id"] for i in items], ["ok"])
+
+    def test_item_count_cap(self):
+        feed, items = om.parse_feed(self.rss("".join(self.item(guid="g%d" % i) for i in range(om.MAX_ITEMS * 10))))
+        self.assertEqual(len(items), om.MAX_ITEMS * 4)
+
+    def test_dtd_is_refused(self):
+        bomb = b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">]><rss><channel><item><title>&lol;</title><guid>g</guid></item></channel></rss>'
+        with self.assertRaises(om.FeedRejected):
+            om.parse_feed(bomb)
+        with self.assertRaises(om.FeedRejected):
+            om.parse_feed(b'<rss><!doctype x><channel></channel></rss>')
+
+    def test_payload_budget_holds_for_worst_case(self):
+        worst = {"schemaVersion": 1, "state": "ready", "message": "m" * om.MAX_MESSAGE_CHARS, "source": "network",
+                 "url": "u" * om.MAX_URL_CHARS, "fetchedTs": 0, "generatedTs": 0,
+                 "feed": {"title": "t" * om.MAX_FEED_TITLE_CHARS, "link": "l" * om.MAX_ID_CHARS, "description": "d" * om.MAX_FEED_DESC_CHARS},
+                 "items": [{"id": "i" * om.MAX_ID_CHARS, "title": "t" * om.MAX_TITLE_CHARS, "link": "l" * om.MAX_ID_CHARS,
+                            "author": "a" * om.MAX_AUTHOR_CHARS, "publishedTs": 4102444800, "summary": "s" * om.MAX_SUMMARY_CHARS,
+                            "blocks": [{"kind": "heading", "text": "x" * (om.MAX_BODY_CHARS // om.MAX_BLOCKS_PER_ITEM)}] * om.MAX_BLOCKS_PER_ITEM,
+                            "links": [{"text": "t" * om.MAX_LINK_TEXT_CHARS, "href": "h" * om.MAX_ID_CHARS}] * om.MAX_LINKS_PER_ITEM,
+                            "read": False}] * om.MAX_ITEMS,
+                 "unread": om.MAX_ITEMS, "newIds": ["i" * om.MAX_ID_CHARS] * om.MAX_ITEMS}
+        import json
+        self.assertLess(len(json.dumps(worst, ensure_ascii=False)), om.MAX_PAYLOAD_CHARS)
+
+    def test_cache_is_coerced(self):
+        cache = om.coerce_cache({"items": [{"id": "ok", "title": "t" * 9999, "blocks": [{"kind": "evil", "text": "x"}, "junk", {"kind": "p", "text": 5}],
+                                            "links": [{"href": "javascript:1", "text": "j"}, {"href": "https://a.example", "extra": 1}], "extra": "dropped"},
+                                           {"id": "bad id"}, "junk"] * 100 + [{"id": "u%d" % i} for i in range(100)], "fetchedTs": "nope", "url": 12, "etag": "e\x00e"})
+        # Junk and duplicates do not count against the cap; distinct valid ids fill it.
+        self.assertEqual(len(cache["items"]), om.MAX_ITEMS)
+        self.assertEqual(cache["items"][1]["id"], "u0")
+        item = cache["items"][0]
+        self.assertEqual(sorted(item.keys()), ["author", "blocks", "id", "link", "links", "publishedTs", "summary", "title"])
+        self.assertEqual(len(item["title"]), om.MAX_TITLE_CHARS)
+        self.assertEqual(item["blocks"], [{"kind": "p", "text": "x"}])
+        self.assertEqual(cache["fetchedTs"], 0)
+        self.assertEqual(cache["url"], "")
+        self.assertEqual(cache["etag"], "ee")
+
+    def test_state_lists_are_bounded(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["OMAPRESS_STATE_DIR"] = tmp
+            try:
+                with open(os.path.join(tmp, "state.json"), "w") as handle:
+                    json.dump({"read": ["r%d" % i for i in range(5000)] + [5, "bad id", ""], "known": "nope"}, handle)
+                state = om.load_state()
+                self.assertEqual(len(state["read"]), om.MAX_STATE_IDS)
+                self.assertEqual(state["known"], [])
+                with open(os.path.join(tmp, "state.json"), "w") as handle:
+                    handle.write("{" + '"read": ["' + "x" * (om.MAX_STATE_BYTES) + '"]}')
+                self.assertEqual(om.load_state()["read"], [])
+            finally:
+                del os.environ["OMAPRESS_STATE_DIR"]
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

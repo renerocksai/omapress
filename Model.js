@@ -1,21 +1,166 @@
 // Pure helpers for the Omapress panel. No Qt access so the file can be
 // unit-tested with node (see tests/model.test.mjs).
 
+// The closed shape of what the helper may hand the panel. These mirror the
+// caps in bin/omapress; the helper derives its output budget from them and
+// this side refuses anything that does not fit, so neither end trusts the
+// other to have stayed within bounds.
+var MAX_PAYLOAD_CHARS = 8 * 1024 * 1024
+var MAX_ITEMS = 50
+var MAX_ID_CHARS = 2048
+var MAX_TITLE_CHARS = 300
+var MAX_AUTHOR_CHARS = 120
+var MAX_SUMMARY_CHARS = 400
+var MAX_BLOCKS_PER_ITEM = 200
+var MAX_BLOCK_CHARS = 4000
+var MAX_BODY_CHARS = 30000
+var MAX_LINKS_PER_ITEM = 30
+var MAX_LINK_TEXT_CHARS = 200
+var MAX_FEED_TITLE_CHARS = 200
+var MAX_FEED_DESC_CHARS = 400
+var MAX_MESSAGE_CHARS = 300
+var MAX_NOTIFY_TITLE_CHARS = 200
+var MAX_NOTIFY_BODY_CHARS = 300
+var BLOCK_KINDS = { p: true, heading: true, item: true, quote: true, code: true }
+
+var CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g
+
+// Text for a single-line surface: control characters out, whitespace
+// collapsed, clipped with an ellipsis.
+function cleanText(value, limit) {
+  var text = String(value === undefined || value === null ? "" : value).replace(CONTROL_RE, "").replace(/\s+/g, " ").trim()
+  if (text.length > limit) text = text.substring(0, Math.max(0, limit - 1)).replace(/\s+$/, "") + "…"
+  return text
+}
+
+// Multi-line text for a reader block: newlines survive, everything else as
+// cleanText.
+function cleanBlockText(value, limit) {
+  var text = String(value === undefined || value === null ? "" : value).replace(CONTROL_RE, "")
+  if (text.length > limit) text = text.substring(0, Math.max(0, limit - 1)) + "…"
+  return text
+}
+
+function cleanId(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  if (text === "" || text.length > MAX_ID_CHARS || /[\s\x00-\x1f\x7f]/.test(text)) return ""
+  return text
+}
+
+function cleanUrlish(value) {
+  var text = typeof value === "string" ? value.trim() : ""
+  return text.length > MAX_ID_CHARS ? "" : text
+}
+
+function notifyText(value, limit) {
+  return cleanText(value, limit === undefined ? MAX_NOTIFY_BODY_CHARS : limit)
+}
+
+function coerceBlock(value) {
+  if (!value || typeof value !== "object") return null
+  var kind = BLOCK_KINDS[value.kind] ? String(value.kind) : "p"
+  if (typeof value.text !== "string") return null
+  var text = cleanBlockText(value.text, MAX_BLOCK_CHARS)
+  return text.trim() === "" ? null : { kind: kind, text: text }
+}
+
+function coerceLink(value) {
+  if (!value || typeof value !== "object") return null
+  var href = cleanUrlish(value.href)
+  if (href === "") return null
+  return { text: cleanText(value.text, MAX_LINK_TEXT_CHARS) || href, href: href }
+}
+
+function coerceItem(value) {
+  if (!value || typeof value !== "object") return null
+  var id = cleanId(value.id)
+  if (id === "") return null
+  var blocks = []
+  var body = 0
+  var rawBlocks = Array.isArray(value.blocks) ? value.blocks : []
+  for (var b = 0; b < rawBlocks.length && blocks.length < MAX_BLOCKS_PER_ITEM; b++) {
+    var block = coerceBlock(rawBlocks[b])
+    if (!block) continue
+    var room = MAX_BODY_CHARS - body
+    if (room <= 0) break
+    if (block.text.length > room) block.text = block.text.substring(0, Math.max(0, room - 1)) + "…"
+    body += block.text.length
+    blocks.push(block)
+  }
+  var links = []
+  var rawLinks = Array.isArray(value.links) ? value.links : []
+  for (var l = 0; l < rawLinks.length && links.length < MAX_LINKS_PER_ITEM; l++) {
+    var link = coerceLink(rawLinks[l])
+    if (link) links.push(link)
+  }
+  var published = Number(value.publishedTs)
+  if (!isFinite(published) || published < 0) published = 0
+  return {
+    id: id,
+    title: cleanText(value.title, MAX_TITLE_CHARS) || "Untitled",
+    link: cleanUrlish(value.link),
+    author: cleanText(value.author, MAX_AUTHOR_CHARS),
+    publishedTs: Math.min(4102444800, Math.floor(published)),
+    summary: cleanText(value.summary, MAX_SUMMARY_CHARS),
+    blocks: blocks,
+    links: links,
+    read: value.read === true
+  }
+}
+
+function coerceFeed(value) {
+  var feed = value && typeof value === "object" ? value : {}
+  return {
+    title: cleanText(feed.title, MAX_FEED_TITLE_CHARS),
+    link: cleanUrlish(feed.link),
+    description: cleanText(feed.description, MAX_FEED_DESC_CHARS)
+  }
+}
+
+// Helper output → the one shape the rest of the plugin reads. Anything
+// outside the schema is dropped, oversized strings are clipped, oversized
+// collections are cut, and a document over the budget is refused whole.
 function parsePayload(raw) {
-  var text = String(raw || "").trim()
+  var text = String(raw || "")
+  if (text.length > MAX_PAYLOAD_CHARS) return { ok: false, error: "Helper output exceeds the size budget" }
+  text = text.trim()
   if (text === "") return { ok: false, error: "Helper returned nothing" }
+  var parsed
   try {
-    var parsed = JSON.parse(text)
-    if (!parsed || typeof parsed !== "object") return { ok: false, error: "Helper returned garbage" }
-    parsed.ok = true
-    parsed.items = Array.isArray(parsed.items) ? parsed.items : []
-    parsed.newIds = Array.isArray(parsed.newIds) ? parsed.newIds : []
-    parsed.feed = parsed.feed && typeof parsed.feed === "object" ? parsed.feed : {}
-    parsed.unread = Number(parsed.unread || 0)
-    parsed.fetchedTs = Number(parsed.fetchedTs || 0)
-    return parsed
+    parsed = JSON.parse(text)
   } catch (e) {
     return { ok: false, error: "Could not parse helper output" }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, error: "Helper returned garbage" }
+  if (parsed.schemaVersion !== 1) return { ok: false, error: "Helper output has an unknown schema" }
+  var state = parsed.state === "error" ? "error" : "ready"
+  var source = parsed.source === "network" || parsed.source === "cache" ? parsed.source : "none"
+  var items = []
+  var rawItems = Array.isArray(parsed.items) ? parsed.items : []
+  var seen = {}
+  for (var i = 0; i < rawItems.length && items.length < MAX_ITEMS; i++) {
+    var item = coerceItem(rawItems[i])
+    if (!item || seen[item.id]) continue
+    seen[item.id] = true
+    items.push(item)
+  }
+  var newIds = []
+  var rawNew = Array.isArray(parsed.newIds) ? parsed.newIds : []
+  for (var n = 0; n < rawNew.length && newIds.length < MAX_ITEMS; n++) {
+    var id = cleanId(rawNew[n])
+    if (id !== "" && seen[id]) newIds.push(id)
+  }
+  var fetched = Number(parsed.fetchedTs)
+  return {
+    ok: true,
+    state: state,
+    message: cleanText(parsed.message, MAX_MESSAGE_CHARS),
+    source: source,
+    feed: coerceFeed(parsed.feed),
+    items: items,
+    unread: unreadCount(items),
+    newIds: newIds,
+    fetchedTs: isFinite(fetched) && fetched > 0 ? Math.floor(fetched) : 0
   }
 }
 
@@ -122,6 +267,14 @@ function blockPrefix(block) {
 
 if (typeof module !== "undefined") {
   module.exports = {
+    MAX_PAYLOAD_CHARS: MAX_PAYLOAD_CHARS,
+    MAX_ITEMS: MAX_ITEMS,
+    MAX_BLOCKS_PER_ITEM: MAX_BLOCKS_PER_ITEM,
+    MAX_LINKS_PER_ITEM: MAX_LINKS_PER_ITEM,
+    cleanText: cleanText,
+    cleanId: cleanId,
+    notifyText: notifyText,
+    coerceItem: coerceItem,
     parsePayload: parsePayload,
     dateLabel: dateLabel,
     relativeTime: relativeTime,
