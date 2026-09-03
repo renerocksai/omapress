@@ -107,7 +107,8 @@ settings UI.
 | `~/.cache/omapress/feed.json` | the last successfully fetched feed |
 
 Delete both to start over. Nothing else is touched: no user configuration,
-no `sudo` or `pkexec`, no systemd units, no installer, no bundled binaries.
+no privilege escalation of any kind, no systemd units, no installer, no
+bundled binaries.
 
 ## Boundaries
 
